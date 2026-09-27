@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.7";
+const RELEASE_VERSION = "1.0.6-personal.8";
 
 type FontStyleId =
     | "normal"
@@ -432,6 +432,10 @@ const settings = definePluginSettings({
         description: "Write a debug log to %APPDATA%\\DiscordLyrics\\debug.log (capped at 1 MB).",
         default: DEFAULT_SETTINGS.debugLogging
     },
+    activitySharingNotice: {
+        type: OptionType.COMPONENT,
+        component: ActivitySharingNotice
+    },
     version: {
         type: OptionType.COMPONENT,
         component: () => React.createElement("div", {
@@ -454,6 +458,38 @@ function cleanText(value: unknown) {
 function getLyricsProxy() {
     return cleanText(settings.store.lyricsProxy);
 }
+
+// Discord → Settings → Activity Privacy → "Share your activity". When it's off, every Rich Presence card is visible
+// only to yourself (CustomRPC warns about the same thing).
+function isActivitySharingOn() {
+    try {
+        return getStatusSetting("showCurrentGame")?.getSetting() !== false;
+    } catch {
+        return true;
+    }
+}
+
+function ActivitySharingNotice() {
+    const setting = getStatusSetting("showCurrentGame");
+    const enabled = setting?.useSetting() !== false;
+    if (!setting || enabled || !settings.store.enableRpc) return null;
+
+    return React.createElement("div", {
+        style: {
+            display: "grid",
+            gap: "8px",
+            padding: "12px",
+            borderRadius: "8px",
+            border: "1px solid var(--status-danger)",
+            color: "var(--text-normal)"
+        }
+    },
+        React.createElement("div", null, "Activity Sharing is off in Discord's privacy settings, so nobody but you sees the Rich Presence card, its buttons or the lyrics credits. Spicy Lyrics stays off until it's enabled."),
+        React.createElement(Button, { onClick: () => void setting.updateSetting(true) }, "Enable Activity Sharing")
+    );
+}
+
+let warnedActivitySharingOff = false;
 
 function cleanDescription(value: unknown) {
     return cleanText(String(value ?? "")
@@ -882,6 +918,12 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         }
         clearRpc();
         return;
+    }
+
+    if (!isActivitySharingOn() && !warnedActivitySharingOff) {
+        warnedActivitySharingOff = true;
+        showToast("DiscordLyrics: Activity Sharing is off, only you can see the Rich Presence card", Toasts.Type.FAILURE);
+        debugLog("activity sharing (status.showCurrentGame) is off: rich presence is local-only");
     }
 
     const fallbackImage = !track.albumImage ? requestFallbackAlbumImage(track, paused) : undefined;
@@ -1472,6 +1514,7 @@ function canUseSpicy(track: NormalizedTrack) {
         && key !== spicyRejectedKey
         && settings.store.enableRpc
         && Boolean(getRpcAppId())
+        && isActivitySharingOn()
         && /^[A-Za-z0-9]{22}$/.test(track.id)
         && Date.now() >= spicyMutedUntil;
 }
