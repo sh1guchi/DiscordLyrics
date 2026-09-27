@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.9";
+const RELEASE_VERSION = "1.0.6-personal.10";
 
 type FontStyleId =
     | "normal"
@@ -151,6 +151,8 @@ interface LyricLine {
     text: string;
     // Start time of every word in text.split(" ") order, when the source has word-level sync.
     wordTimesMs?: number[];
+    // When each of those words has finished being sung.
+    wordEndTimesMs?: number[];
 }
 
 // Who to credit for the lyrics on screen (Spicy Lyrics API terms, section 6).
@@ -178,7 +180,7 @@ interface SpicyBody {
         StartTime?: number;
         Lead?: {
             StartTime?: number;
-            Syllables?: Array<{ Text?: string; StartTime?: number; IsPartOfWord?: boolean; }>;
+            Syllables?: Array<{ Text?: string; StartTime?: number; EndTime?: number; IsPartOfWord?: boolean; }>;
         };
     }>;
     Lines?: Array<{ Text?: string; }>;
@@ -1532,11 +1534,12 @@ function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean
         const lines: LyricLine[] = [];
         for (const entry of body.Content ?? []) {
             // IsPartOfWord = this syllable joins the next one without a space.
-            const words: Array<{ text: string; startMs: number; }> = [];
-            let current: { text: string; startMs: number; } | undefined;
+            const words: Array<{ text: string; startMs: number; endMs: number; }> = [];
+            let current: { text: string; startMs: number; endMs: number; } | undefined;
             for (const syllable of entry.Lead?.Syllables ?? []) {
-                current ??= { text: "", startMs: Number(syllable.StartTime ?? 0) * 1000 };
+                current ??= { text: "", startMs: Number(syllable.StartTime ?? 0) * 1000, endMs: 0 };
                 current.text += String(syllable.Text ?? "");
+                current.endMs = Number(syllable.EndTime ?? 0) * 1000; // a word ends with its last syllable
                 if (!syllable.IsPartOfWord) {
                     words.push(current);
                     current = undefined;
@@ -1544,12 +1547,14 @@ function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean
             }
             if (current) words.push(current);
 
-            const flat = words.flatMap(word => cleanText(word.text).split(" ").filter(Boolean).map(text => ({ text, startMs: word.startMs })));
+            const flat = words.flatMap(word => cleanText(word.text).split(" ").filter(Boolean).map(text => ({ text, startMs: word.startMs, endMs: word.endMs })));
             if (!flat.length) continue;
             lines.push({
                 timeMs: Number(entry.Lead?.StartTime ?? flat[0].startMs / 1000) * 1000,
                 text: flat.map(word => word.text).join(" "),
-                wordTimesMs: flat.map(word => word.startMs)
+                wordTimesMs: flat.map(word => word.startMs),
+                // Missing/invalid end time: assume the word lasts until the next one starts.
+                wordEndTimesMs: flat.map((word, i) => word.endMs > word.startMs ? word.endMs : (flat[i + 1]?.startMs ?? word.startMs))
             });
         }
         return { lines: lines.sort((a, b) => a.timeMs - b.timeMs), synced: true };
@@ -1825,18 +1830,23 @@ function lineDisplayMs(line: ActiveLyricLine) {
     return gapMs;
 }
 
+interface PagePlan {
+    chunks: string[];
+    // When each page appears, relative to the line start (in progress time, which includes lyricOffsetMs).
+    starts: number[];
+    fitsBubble: boolean;
+}
+
+// lyricAt() hands out a fresh object every tick, so cache by content rather than identity.
+let lastPagePlan: { key: string; plan: PagePlan; } | undefined;
+
 function lyricPageForStatus(line: ActiveLyricLine, progressMs: number) {
-    const displayMs = lineDisplayMs(line);
-    const maxPages = Math.max(1, Math.floor(displayMs / MIN_PAGE_MS));
-    const chunks = splitLyricChunks(line.text, maxPages);
-    const fitsBubble = chunks.every(chunk => [...chunk].length <= Math.max(8, getLyricChunkLimit()));
-    if (chunks.length <= 1) return formatStatus(chunks[0], true, fitsBubble);
+    const { chunks, starts, fitsBubble } = planPages(line);
 
     // progressMs already includes lyricOffsetMs, and so does the moment the line appeared, so time on screen is
     // simply progress - line start. (The original also subtracted the offset here, which cut the last 650 ms of
     // every line's page schedule; together with weight-based timing that pushed the last page into that cut.)
     const elapsedMs = Math.max(0, progressMs - line.timeMs);
-    const starts = pageStartTimes(line, chunks, displayMs);
     let index = 0;
     for (let page = 1; page < chunks.length; page++) {
         if (elapsedMs >= starts[page]) index = page;
@@ -1844,22 +1854,58 @@ function lyricPageForStatus(line: ActiveLyricLine, progressMs: number) {
     return formatStatus(chunks[index], true, fitsBubble);
 }
 
-// When each page appears, relative to the line start. With word-level sync a page appears when its first word is
-// sung; otherwise pages share the time equally. Either way each page stays up at least MIN_PAGE_MS.
-function pageStartTimes(line: ActiveLyricLine, chunks: string[], displayMs: number) {
+function planPages(line: ActiveLyricLine): PagePlan {
+    const displayMs = lineDisplayMs(line);
+    const limit = Math.max(8, getLyricChunkLimit());
+    const offsetMs = Math.max(0, getStoredNumber("lyricOffsetMs", DEFAULT_SETTINGS.lyricOffsetMs));
+    const key = `${line.timeMs}|${line.nextTimeMs}|${displayMs}|${limit}|${offsetMs}|${line.text}`;
+    if (lastPagePlan?.key === key) return lastPagePlan.plan;
+
+    // Most pages that fit the time; with word sync, fewer (wider) pages when waiting for words to finish would
+    // leave a page on screen for less than MIN_PAGE_MS. One page always works.
+    let plan: PagePlan | undefined;
+    for (let pages = Math.max(1, Math.floor(displayMs / MIN_PAGE_MS)); pages >= 1 && !plan; pages--) {
+        const chunks = splitLyricChunks(line.text, pages);
+        const starts = pageStartTimes(line, chunks, displayMs, offsetMs);
+        if (starts) plan = { chunks, starts, fitsBubble: chunks.every(chunk => [...chunk].length <= limit) };
+    }
+    plan ??= { chunks: [line.text], starts: [0], fitsBubble: [...line.text].length <= limit };
+
+    lastPagePlan = { key, plan };
+    return plan;
+}
+
+// Page start times relative to the line start, or null if this split doesn't work.
+// With word-level sync a page appears when its first word is sung, but never before the last word of the previous
+// page has finished (in real song time, i.e. without the lyricOffsetMs head start), and every page has to stay up
+// at least MIN_PAGE_MS. Without word sync, pages share the time equally.
+function pageStartTimes(line: ActiveLyricLine, chunks: string[], displayMs: number, offsetMs: number): number[] | null {
     const count = chunks.length;
     const wordsPerChunk = chunks.map(chunk => chunk.split(" ").length);
+    const starts = [0];
     const words = line.wordTimesMs;
     const wordSynced = Boolean(words) && wordsPerChunk.reduce((sum, n) => sum + n, 0) === words!.length;
 
-    const starts = [0];
+    if (!wordSynced) {
+        for (let page = 1; page < count; page++) {
+            const earliest = starts[page - 1] + MIN_PAGE_MS;
+            const latest = displayMs - (count - page) * MIN_PAGE_MS;
+            starts.push(Math.min(Math.max(page * displayMs / count, earliest), latest));
+        }
+        return starts;
+    }
+
+    const ends = line.wordEndTimesMs;
     let firstWord = 0;
     for (let page = 1; page < count; page++) {
         firstWord += wordsPerChunk[page - 1];
-        const wanted = wordSynced ? words![firstWord] - line.timeMs : page * displayMs / count;
-        const earliest = starts[page - 1] + MIN_PAGE_MS;
-        const latest = displayMs - (count - page) * MIN_PAGE_MS;
-        starts.push(Math.min(Math.max(wanted, earliest), latest));
+        const firstWordSung = words![firstWord] - line.timeMs;
+        const previousWordDone = (ends?.[firstWord - 1] ?? words![firstWord]) - line.timeMs + offsetMs;
+        starts.push(Math.max(firstWordSung, previousWordDone));
+    }
+
+    for (let page = 0; page < count; page++) {
+        if ((starts[page + 1] ?? displayMs) - starts[page] < MIN_PAGE_MS) return null;
     }
     return starts;
 }
