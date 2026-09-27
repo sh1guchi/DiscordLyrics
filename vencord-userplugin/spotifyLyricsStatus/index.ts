@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.8";
+const RELEASE_VERSION = "1.0.6-personal.9";
 
 type FontStyleId =
     | "normal"
@@ -1019,13 +1019,14 @@ function getLyricsCredit(hasCover: boolean) {
 const PLUGIN_URL = "https://github.com/sh1guchi/DiscordLyrics";
 const MAX_ACTIVITY_BUTTONS = 2; // Discord's limit
 
-// Required lyrics credits first; the optional plugin link only takes a free slot.
+// Required lyrics credits always get their slots; the optional plugin link only takes a free one.
+// When both are shown, the plugin link goes on top and the credit below it.
 function getRpcButtons(creditButtons: Array<{ label: string; url: string; }>) {
-    const buttons = creditButtons.slice(0, MAX_ACTIVITY_BUTTONS);
-    if (settings.store.rpcShowPluginButton && buttons.length < MAX_ACTIVITY_BUTTONS) {
-        buttons.push({ label: "Using DiscordLyrics", url: PLUGIN_URL });
+    const credits = creditButtons.slice(0, MAX_ACTIVITY_BUTTONS);
+    if (settings.store.rpcShowPluginButton && credits.length < MAX_ACTIVITY_BUTTONS) {
+        return [{ label: "Using DiscordLyrics", url: PLUGIN_URL }, ...credits];
     }
-    return buttons;
+    return credits;
 }
 
 function getTrackSubtitle(track: NormalizedTrack) {
