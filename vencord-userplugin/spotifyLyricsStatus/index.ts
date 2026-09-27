@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import { UserSettings } from "@api/UserSettings";
 import { SpotifyStore } from "@plugins/spotifyControls/SpotifyStore";
 import definePlugin, { OptionType, type PluginNative } from "@utils/types";
 import type { Activity } from "@vencord/discord-types";
 import { ActivityFlags, ActivityStatusDisplayType, ActivityType } from "@vencord/discord-types/enums";
-import { ApplicationAssetUtils, Button, ConfirmModal, FluxDispatcher, openModal, React, showToast, Toasts, UserStore } from "@webpack/common";
+import { ApplicationAssetUtils, Button, FluxDispatcher, React, showToast, Toasts, UserStore } from "@webpack/common";
 
 const Native = (VencordNative.pluginHelpers.DiscordLyrics ?? VencordNative.pluginHelpers.SpotifyLyricsStatus) as PluginNative<typeof import("./native")>;
 
@@ -29,15 +28,12 @@ const DEFAULT_SETTINGS = {
     enableRpc: true,
     rpcName: "Spotify",
     rpcShowWhenPaused: true,
-    rpcShowAlbumArt: true
+    rpcShowAlbumArt: true,
+    windowsMediaFallback: true,
+    debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6";
-const REPO = "MallyDev2/DiscordLyrics";
-const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
-const LAST_UPDATE_CHECK_KEY = "DiscordLyrics.lastUpdateCheck";
-const LAST_UPDATE_VERSION_KEY = "DiscordLyrics.lastUpdateVersion";
-const AUTO_UPDATE_SESSION_KEY = "DiscordLyrics.autoUpdateCheckedAt";
+const RELEASE_VERSION = "1.0.6-personal.2";
 
 type FontStyleId =
     | "normal"
@@ -169,6 +165,8 @@ interface LrcLibResult {
 }
 
 interface WindowsSpotifyState {
+    ready?: boolean;
+    ageMs?: number;
     processRunning?: boolean;
     track?: {
         title?: string;
@@ -209,20 +207,34 @@ let spotifyPollInFlight = false;
 let lastPlaybackPlaying: boolean | undefined;
 let spotifyUnavailableAt = 0;
 let spotifyPollMutedUntil = 0;
+let statusExpiryCleared = false;
 
 const STATUS_SOCKET_ID = "SpotifyLyricsStatus";
 const RPC_SOCKET_ID = "SpotifyLyricsStatusRpc";
-const MIN_REMOTE_STATUS_INTERVAL_MS = 150;
-const SPOTIFY_POLL_INTERVAL_MS = 500;
-const WINDOWS_SPOTIFY_POLL_INTERVAL_MS = 2000;
+// Each remote status change is a request to Discord; lines that change faster than this are coalesced.
+const MIN_REMOTE_STATUS_INTERVAL_MS = 1000;
+// Discord already pushes SPOTIFY_PLAYER_STATE over its socket; polling the Web API is only drift correction.
+const SPOTIFY_POLL_INTERVAL_MS = 5000;
+const SPOTIFY_POLL_ERROR_MUTE_MS = 30000;
+const WINDOWS_SPOTIFY_POLL_INTERVAL_MS = 1000;
 const SPOTIFY_STATE_FRESH_MS = 15000;
-const WINDOWS_SPOTIFY_STATE_FRESH_MS = 10000;
+const WINDOWS_SPOTIFY_STATE_FRESH_MS = 5000;
 const WINDOWS_SPOTIFY_PROCESS_GRACE_MS = 15000;
 const SPOTIFY_UNAVAILABLE_GRACE_MS = 5000;
 const LAST_KNOWN_SPOTIFY_TRACK_MS = 30 * 60 * 1000;
+const CACHE_LIMIT = 200;
+const LYRICS_CACHE_LIMIT = 50;
 const albumAssetCache = new Map<string, Promise<string | undefined>>();
 const albumAssetResolved = new Map<string, string | undefined>();
+const lyricsCache = new Map<string, LyricLine[]>();
+const statusSettingCache = new Map<string, ReturnType<typeof findStatusSetting>>();
 const pluginAuthor = { name: "mally", id: 0n };
+
+function setBounded<K, V>(map: Map<K, V>, key: K, value: V, limit = CACHE_LIMIT) {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > limit) map.delete(map.keys().next().value as K);
+}
 
 function updatePluginAuthor() {
     try {
@@ -233,11 +245,13 @@ function updatePluginAuthor() {
 }
 
 function debugLog(message: string) {
+    if (!settings.store.debugLogging) return;
     const promise = Native?.logDebug?.(message) as Promise<void> | undefined;
     void promise?.catch(() => void 0);
 }
 
 function logStatusUserSettings() {
+    if (!settings.store.debugLogging) return;
     try {
         const statusSettings = Object.values(UserSettings ?? {})
             .filter(setting => setting?.userSettingsAPIGroup === "status")
@@ -261,9 +275,19 @@ function logStatusUserSettings() {
     }
 }
 
-function getStatusSetting(name: string) {
+function findStatusSetting(name: string) {
     return Object.values(UserSettings ?? {})
         .find(setting => setting?.userSettingsAPIGroup === "status" && setting.userSettingsAPIName === name);
+}
+
+// Called several times per tick; the lookup scans every user setting, so remember the result.
+function getStatusSetting(name: string) {
+    let setting = statusSettingCache.get(name);
+    if (!setting) {
+        setting = findStatusSetting(name);
+        if (setting) statusSettingCache.set(name, setting);
+    }
+    return setting;
 }
 
 function resetPluginDefaults() {
@@ -274,292 +298,6 @@ function resetPluginDefaults() {
     restartTimer();
     tick();
     showToast("DiscordLyrics settings reset", Toasts.Type.SUCCESS);
-}
-
-interface GithubRelease {
-    tag_name?: string;
-    name?: string;
-    html_url?: string;
-    body?: string;
-}
-
-function normalizeVersion(value: unknown) {
-    const match = String(value ?? "").match(/\d+\.\d+\.\d+/);
-    return match ? match[0] : "";
-}
-
-function compareVersions(a: string, b: string) {
-    const left = a.split(".").map(Number);
-    const right = b.split(".").map(Number);
-
-    for (let index = 0; index < 3; index++) {
-        if ((left[index] || 0) > (right[index] || 0)) return 1;
-        if ((left[index] || 0) < (right[index] || 0)) return -1;
-    }
-
-    return 0;
-}
-
-function formatLastChecked(value: string | null) {
-    const timestamp = Number(value);
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return "Last checked: never";
-    return `Last checked: ${new Date(timestamp).toLocaleString()}`;
-}
-
-async function fetchLatestRelease() {
-    const response = await Native.fetchGithubRelease(LATEST_RELEASE_API) as { status: number; data: GithubRelease | null; };
-    if (response.status < 200 || response.status >= 300 || !response.data) {
-        throw new Error(`Release lookup returned ${response.status}`);
-    }
-
-    return response.data;
-}
-
-async function checkForDiscordLyricsUpdate(options: { silentIfCurrent?: boolean; source?: "startup" | "manual"; } = {}) {
-    const checkedAt = String(Date.now());
-    await DataStore.set(LAST_UPDATE_CHECK_KEY, checkedAt);
-
-    try {
-        const release = await fetchLatestRelease();
-        const latest = normalizeVersion(release.tag_name || release.name || "");
-        if (latest) await DataStore.set(LAST_UPDATE_VERSION_KEY, latest);
-
-        if (!latest || compareVersions(latest, RELEASE_VERSION) <= 0) {
-            if (!options.silentIfCurrent) showToast("DiscordLyrics is up to date", Toasts.Type.SUCCESS);
-            return { latest: latest || RELEASE_VERSION, checkedAt };
-        }
-
-        debugLog(`update available current=${RELEASE_VERSION} latest=${latest} source=${options.source || "manual"}`);
-        showUpdateFoundModal(latest, release);
-
-        return { latest, checkedAt };
-    } catch (error) {
-        debugLog(`update check failed ${stringifyError(error)}`);
-        if (!options.silentIfCurrent) showToast("DiscordLyrics update check failed", Toasts.Type.FAILURE);
-        return { latest: "", checkedAt };
-    }
-}
-
-async function checkForDiscordLyricsUpdateOnStartup() {
-    try {
-        const sessionKey = `${Date.now() - performance.now()}`;
-        if (await DataStore.get<string>(AUTO_UPDATE_SESSION_KEY) === sessionKey) return;
-        await DataStore.set(AUTO_UPDATE_SESSION_KEY, sessionKey);
-        await checkForDiscordLyricsUpdate({ silentIfCurrent: true, source: "startup" });
-    } catch (error) {
-        debugLog(`startup update check failed ${stringifyError(error)}`);
-    }
-}
-
-function releaseBodyPreview(body: string) {
-    const value = typeof body === "object" && body && "value" in body ? (body as any).value : body;
-    const text = String(value || "No release notes were provided.")
-        .replace(/\r\n/g, "\n")
-        .replace(/[ \t]+\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-    return text.length > 1200 ? `${text.slice(0, 1200)}...` : text;
-}
-
-function renderReleaseNotes(body: string) {
-    const text = releaseBodyPreview(body);
-    const blocks: any[] = [];
-    let listItems: string[] = [];
-    const mutedText = "var(--text-muted)";
-    const headingText = "var(--header-primary)";
-
-    const flushList = () => {
-        if (!listItems.length) return;
-        const items = listItems;
-        listItems = [];
-        blocks.push(React.createElement("ul", {
-            key: `list-${blocks.length}`,
-            style: { margin: "0 0 0 18px", padding: 0, color: "var(--text-normal)" }
-        }, items.map((item, index) => React.createElement("li", {
-            key: index,
-            style: { marginBottom: "4px" }
-        }, item))));
-    };
-
-    for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) {
-            flushList();
-            continue;
-        }
-
-        const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-        if (heading) {
-            flushList();
-            const level = heading[1].length;
-            blocks.push(React.createElement("div", {
-                key: `heading-${blocks.length}`,
-                style: {
-                    color: headingText,
-                    fontWeight: 700,
-                    fontSize: level <= 2 ? "16px" : "14px",
-                    marginTop: blocks.length ? "6px" : 0
-                }
-            }, heading[2]));
-            continue;
-        }
-
-        const bullet = /^[-*]\s+(.+)$/.exec(line);
-        if (bullet) {
-            listItems.push(bullet[1]);
-            continue;
-        }
-
-        flushList();
-        blocks.push(React.createElement("p", {
-            key: `paragraph-${blocks.length}`,
-            style: { margin: 0, color: mutedText, lineHeight: 1.45 }
-        }, line));
-    }
-
-    flushList();
-    return blocks.length ? blocks : React.createElement("p", { style: { margin: 0, color: mutedText } }, "No release notes were provided.");
-}
-
-const themedModalBodyStyle = {
-    display: "grid",
-    gap: "10px",
-    maxHeight: "280px",
-    overflow: "auto",
-    color: "var(--text-normal)"
-};
-
-const themedMutedMetaStyle = {
-    color: "var(--text-muted)",
-    fontSize: "12px"
-};
-
-function showUpdateFoundModal(version: string, release: GithubRelease) {
-    openModal(props => React.createElement(ConfirmModal, {
-        ...props,
-        title: "Update found",
-        subtitle: `DiscordLyrics ${version} is available. Install it and restart Discord?`,
-        confirmText: "Install and restart",
-        cancelText: "Later",
-        variant: "primary",
-        onConfirm: () => {
-            showToast("DiscordLyrics update started", Toasts.Type.MESSAGE);
-            void Native.installUpdate(version, release.body || "").catch(error => {
-                debugLog(`update install failed ${stringifyError(error)}`);
-                showToast("DiscordLyrics update could not start", Toasts.Type.FAILURE);
-            });
-        },
-        onCancel: () => void 0
-    }, React.createElement("div", {
-        style: {
-            ...themedModalBodyStyle,
-            display: "grid",
-            gap: "10px",
-            maxHeight: "260px",
-            overflow: "auto"
-        }
-    },
-        React.createElement("strong", { style: { color: "var(--header-primary)" } }, "What's new"),
-        React.createElement("div", { style: { display: "grid", gap: "8px" } }, renderReleaseNotes(release.body || "")),
-        React.createElement("div", { style: themedMutedMetaStyle }, release.html_url || `https://github.com/${REPO}/releases/latest`)
-    )));
-}
-
-let pendingUpdateNoticeOpen = false;
-
-async function showPendingUpdateNotice(attempt = 1) {
-    if (pendingUpdateNoticeOpen) return;
-
-    const readPendingUpdateNotice = Native.readPendingUpdateNotice;
-    if (typeof readPendingUpdateNotice !== "function") {
-        debugLog(`pending update notice reader unavailable attempt=${attempt}`);
-        if (attempt < 6) window.setTimeout(() => void showPendingUpdateNotice(attempt + 1), 5000);
-        return;
-    }
-
-    const notice = await readPendingUpdateNotice() as { version?: string; body?: string; } | null;
-    if (!notice?.version) {
-        return;
-    }
-
-    pendingUpdateNoticeOpen = true;
-    const clearNotice = () => {
-        pendingUpdateNoticeOpen = false;
-        void Native.clearPendingUpdateNotice?.();
-    };
-
-    try {
-        openModal(props => React.createElement(ConfirmModal, {
-            ...props,
-            title: "DiscordLyrics updated",
-            subtitle: `Version ${notice.version} is installed.`,
-            confirmText: "Nice",
-            cancelText: "Close",
-            variant: "primary",
-            onConfirm: clearNotice,
-            onCancel: clearNotice
-        }, React.createElement("div", {
-            style: themedModalBodyStyle
-        },
-            React.createElement("strong", { style: { color: "var(--header-primary)" } }, "What's new"),
-            React.createElement("div", { style: { display: "grid", gap: "8px" } }, renderReleaseNotes(notice.body || ""))
-        )));
-        debugLog(`pending update notice opened version=${notice.version}`);
-    } catch (error) {
-        pendingUpdateNoticeOpen = false;
-        debugLog(`pending update notice failed attempt=${attempt} ${stringifyError(error)}`);
-        if (attempt < 6) window.setTimeout(() => void showPendingUpdateNotice(attempt + 1), 5000);
-    }
-}
-
-function UpdateSettingsControl() {
-    const [lastChecked, setLastChecked] = React.useState<string | null>(null);
-    const [latestVersion, setLatestVersion] = React.useState<string | null>(null);
-    const [checking, setChecking] = React.useState(false);
-
-    React.useEffect(() => {
-        let mounted = true;
-
-        void Promise.all([
-            DataStore.get<string>(LAST_UPDATE_CHECK_KEY),
-            DataStore.get<string>(LAST_UPDATE_VERSION_KEY)
-        ]).then(([storedLastChecked, storedLatestVersion]) => {
-            if (!mounted) return;
-            setLastChecked(storedLastChecked ?? null);
-            setLatestVersion(storedLatestVersion ?? null);
-        });
-
-        return () => {
-            mounted = false;
-        };
-    }, []);
-
-    return React.createElement("div", {
-        style: {
-            display: "grid",
-            gap: "8px",
-            padding: "12px",
-            border: "1px solid var(--background-modifier-accent)",
-            borderRadius: "8px",
-            background: "var(--background-secondary)",
-            color: "var(--text-normal)"
-        }
-    },
-        React.createElement(Button, {
-            color: Button.Colors.PRIMARY,
-            disabled: checking,
-            onClick: async () => {
-                setChecking(true);
-                const result = await checkForDiscordLyricsUpdate({ source: "manual" });
-                setLastChecked(result.checkedAt);
-                setLatestVersion(result.latest || ((await DataStore.get<string>(LAST_UPDATE_VERSION_KEY)) ?? null));
-                setChecking(false);
-            }
-        }, checking ? "Checking..." : "Check for updates"),
-        React.createElement("div", { style: themedMutedMetaStyle }, `Current version: ${RELEASE_VERSION}`),
-        React.createElement("div", { style: themedMutedMetaStyle }, `Latest on GitHub: ${latestVersion || "not checked"}`),
-        React.createElement("div", { style: themedMutedMetaStyle }, formatLastChecked(lastChecked))
-    );
 }
 
 const settings = definePluginSettings({
@@ -616,6 +354,22 @@ const settings = definePluginSettings({
         description: "Show the song cover on Rich Presence.",
         default: DEFAULT_SETTINGS.rpcShowAlbumArt
     },
+    windowsMediaFallback: {
+        type: OptionType.BOOLEAN,
+        description: "Read Spotify from Windows media controls when Discord has no Spotify data (e.g. account not linked).",
+        default: DEFAULT_SETTINGS.windowsMediaFallback
+    },
+    debugLogging: {
+        type: OptionType.BOOLEAN,
+        description: "Write a debug log to %APPDATA%\\DiscordLyrics\\debug.log (capped at 1 MB).",
+        default: DEFAULT_SETTINGS.debugLogging
+    },
+    version: {
+        type: OptionType.COMPONENT,
+        component: () => React.createElement("div", {
+            style: { color: "var(--text-muted)", fontSize: "12px" }
+        }, `DiscordLyrics ${RELEASE_VERSION}`)
+    },
     resetToDefaults: {
         type: OptionType.COMPONENT,
         component: () => React.createElement(Button, {
@@ -645,11 +399,9 @@ function getStoredNumber(key: keyof typeof DEFAULT_SETTINGS, fallback: number) {
     return Number.isFinite(value) ? value : fallback;
 }
 
-function truncateStatus(value: string) {
-    const maxLength = Math.min(
-        getStatusBubbleLimit(),
-        Math.max(1, getStoredNumber("maxStatusLength", DEFAULT_SETTINGS.maxStatusLength))
-    );
+function truncateStatus(value: string, fitBubble = true) {
+    const statusLimit = Math.max(1, getStoredNumber("maxStatusLength", DEFAULT_SETTINGS.maxStatusLength));
+    const maxLength = fitBubble ? Math.min(getStatusBubbleLimit(), statusLimit) : statusLimit;
     const text = cleanText(value);
     return shortenToWords(text, maxLength);
 }
@@ -765,8 +517,8 @@ function applyFontStyle(value: string) {
     switch (settings.store.fontStyle as FontStyleId) {
         case "uppercase": return text.toUpperCase();
         case "lowercase": return text.toLowerCase();
-        case "title": return text.toLowerCase().replace(/\b\w/g, char => char.toUpperCase());
-        case "wide": return text.split("").join(" ");
+        case "title": return text.toLowerCase().replace(/(^|[\s"'(-])(\p{L})/gu, (_, before, char) => before + char.toUpperCase());
+        case "wide": return [...text].join(" ");
         case "fullwidth": return styleAlphabet(text, "fullwidth");
         case "mono": return styleAlphabet(text, "mono");
         case "bold": return styleAlphabet(text, "bold");
@@ -790,8 +542,10 @@ function applyFontStyle(value: string) {
     }
 }
 
-function formatStatus(value: string, styled = true) {
-    return truncateStatus(styled ? applyFontStyle(value) : value);
+// fitBubble=false keeps up to Discord's 128-char limit instead of the ~46 chars the profile bubble fits;
+// used for lines too fast to page through, where cutting them would lose the end of the line.
+function formatStatus(value: string, styled = true, fitBubble = true) {
+    return truncateStatus(styled ? applyFontStyle(value) : value, fitBubble);
 }
 
 function getTickMs() {
@@ -828,8 +582,13 @@ function forceRemoteStatus(status: string, reason: string) {
     setRemoteStatus(status, true);
 }
 
+let lastStatusResyncCheckAt = 0;
+
 function ensureRemoteStatusMatches(status: string) {
     if (!status || isWaitingStatus(status)) return;
+    // Runs every tick; checking (and possibly re-sending) at most every 30 s is plenty.
+    if (Date.now() - lastStatusResyncCheckAt < 30000) return;
+    lastStatusResyncCheckAt = Date.now();
 
     const currentStatus = getCurrentCustomStatusText();
     if (currentStatus !== status) {
@@ -839,7 +598,8 @@ function ensureRemoteStatusMatches(status: string) {
 }
 
 function setProfileStatus(text: string) {
-    const status = truncateStatus(text);
+    // Callers pass text already sized by formatStatus(); only enforce Discord's hard limit here.
+    const status = truncateStatus(text, false);
     const waitingStatus = isWaitingStatus(status);
 
     if (status === lastStatusText) {
@@ -881,29 +641,24 @@ function clearPendingWaitingRemoteStatus() {
     }
 }
 
-function setRemoteStatus(status: string, urgent = false) {
+function setRemoteStatus(status: string, _urgent = false) {
     pendingRemoteStatusText = status;
-    scheduleRemoteStatusFlush(urgent);
+    scheduleRemoteStatusFlush();
 }
 
-function scheduleRemoteStatusFlush(urgent = false) {
-    if (remoteStatusInFlight) return;
-
-    if (urgent && remoteStatusTimer) {
-        clearTimeout(remoteStatusTimer);
-        remoteStatusTimer = undefined;
-        nextRemoteStatusAt = 0;
-    }
-
-    if (remoteStatusTimer) return;
+// Sends immediately when allowed, otherwise once when the rate limit window ends, with whatever
+// status is pending at that moment. (The original reset the limit on "urgent" updates, so fast
+// lyric changes bypassed it on every other line.)
+function scheduleRemoteStatusFlush() {
+    if (remoteStatusInFlight || remoteStatusTimer) return;
 
     const delay = Math.max(0, nextRemoteStatusAt - Date.now());
-    if (urgent && delay === 0) {
+    if (delay === 0) {
         void flushRemoteStatus();
         return;
     }
 
-    remoteStatusTimer = window.setTimeout(() => void flushRemoteStatus(), delay);
+    remoteStatusTimer = setTimeout(() => void flushRemoteStatus(), delay);
 }
 
 async function flushRemoteStatus() {
@@ -922,17 +677,18 @@ async function flushRemoteStatus() {
         const customStatus = getStatusSetting("customStatus");
         if (!customStatus) throw new Error("status.customStatus setting was not found");
 
-        if (status !== lastRemoteStatusText) {
-            await customStatus.updateSetting(status ? { text: status } : undefined);
+        const wasEmpty = !lastRemoteStatusText;
+        await customStatus.updateSetting(status ? { text: status } : undefined);
+
+        // Expiry and creation time only need to be written once, not with every lyric line (3 requests -> 1).
+        if (status && !statusExpiryCleared) {
+            await getStatusSetting("statusExpiresAtMs")?.updateSetting("0");
+            statusExpiryCleared = true;
         }
 
-        const expiresAtMs = getStatusSetting("statusExpiresAtMs");
-        if (expiresAtMs) {
-            await expiresAtMs.updateSetting("0");
+        if (status && wasEmpty) {
+            await getStatusSetting("statusCreatedAtMs")?.updateSetting({ value: String(Date.now()) });
         }
-
-        const createdAtMs = getStatusSetting("statusCreatedAtMs");
-        if (createdAtMs && status) await createdAtMs.updateSetting({ value: String(Date.now()) });
 
         lastRemoteStatusText = status;
         nextRemoteStatusAt = Date.now() + MIN_REMOTE_STATUS_INTERVAL_MS;
@@ -1014,10 +770,10 @@ function getAlbumAsset(track: NormalizedTrack) {
     if (albumAssetResolved.has(track.albumImage)) return albumAssetResolved.get(track.albumImage);
 
     if (!albumAssetCache.has(track.albumImage)) {
-        albumAssetCache.set(track.albumImage, ApplicationAssetUtils.fetchAssetIds("0", [track.albumImage])
+        setBounded(albumAssetCache, track.albumImage, ApplicationAssetUtils.fetchAssetIds("0", [track.albumImage])
             .then(ids => {
                 const asset = ids[0];
-                albumAssetResolved.set(track.albumImage, asset);
+                setBounded(albumAssetResolved, track.albumImage, asset);
                 debugLog(`album art resolved "${track.albumImage}" -> "${asset ?? ""}"`);
                 const current = getCurrentTrack();
                 if (current && trackKey(current) === trackKey(track)) tick();
@@ -1025,7 +781,7 @@ function getAlbumAsset(track: NormalizedTrack) {
             })
             .catch(error => {
                 console.warn("[SpotifyLyricsStatus] Could not fetch album art", error);
-                albumAssetResolved.set(track.albumImage, undefined);
+                setBounded(albumAssetResolved, track.albumImage, undefined);
                 return undefined;
             }));
     }
@@ -1103,11 +859,11 @@ async function lookupFallbackAlbumImage(track: NormalizedTrack) {
         try {
             const searchAlbumImage = Native?.searchAlbumImage as ((title: string, artist: string, album: string) => Promise<string>) | undefined;
             const url = searchAlbumImage ? cleanText(await searchAlbumImage(track.title, track.artist, track.album)) : undefined;
-            fallbackAlbumImageCache.set(key, url);
+            setBounded(fallbackAlbumImageCache, key, url);
             return url;
         } catch (error) {
             debugLog(`fallback album art failed ${stringifyError(error)}`);
-            fallbackAlbumImageCache.set(key, undefined);
+            setBounded(fallbackAlbumImageCache, key, undefined);
             return undefined;
         } finally {
             fallbackAlbumImageRequests.delete(key);
@@ -1203,7 +959,16 @@ function rememberSpotifyTrack(track: NormalizedTrack) {
     return track;
 }
 
+function discordHasSpotifyData() {
+    if (SpotifyStore.track?.name) return true;
+    return Boolean(spotifyState?.track && spotifyState.receivedAt && Date.now() - spotifyState.receivedAt < SPOTIFY_STATE_FRESH_MS);
+}
+
+// The native side keeps one long-lived PowerShell watcher and answers from memory, so this IPC call is cheap.
+// The watcher stops by itself a minute after the last call, i.e. while Discord's own Spotify data is available.
 async function pollWindowsSpotifyState(force = false) {
+    if (!settings.store.windowsMediaFallback) return;
+
     const now = Date.now();
     if (windowsSpotifyPollInFlight || (!force && now - lastWindowsSpotifyPollAt < WINDOWS_SPOTIFY_POLL_INTERVAL_MS)) return;
 
@@ -1215,13 +980,16 @@ async function pollWindowsSpotifyState(force = false) {
 
     try {
         const state = await getWindowsSpotifyState();
-        windowsSpotifyProcessRunning = Boolean(state?.processRunning);
-        if (windowsSpotifyProcessRunning) windowsSpotifyProcessSeenAt = Date.now();
-        const track = normalizeWindowsSpotifyTrack(state ?? {});
+        if (!state?.ready) return; // watcher still starting up
+        const receivedAt = Date.now() - Math.max(0, Number(state.ageMs) || 0);
+
+        windowsSpotifyProcessRunning = Boolean(state.processRunning);
+        if (windowsSpotifyProcessRunning) windowsSpotifyProcessSeenAt = receivedAt;
+        const track = normalizeWindowsSpotifyTrack(state);
 
         if (track) {
             windowsSpotifyTrack = rememberSpotifyTrack(track);
-            windowsSpotifyTrackReceivedAt = Date.now();
+            windowsSpotifyTrackReceivedAt = receivedAt;
             spotifyUnavailableAt = 0;
             debugLog(`windows spotify ${windowsSpotifyTrack.isPlaying ? "playing" : "paused"} "${windowsSpotifyTrack.title}" ${Math.round(windowsSpotifyTrack.progressMs)}ms`);
             tick();
@@ -1257,7 +1025,13 @@ function getCurrentTrack(): NormalizedTrack | undefined {
     const track: SpotifyTrack | null = useStore ? storeTrack : useState ? stateTrack : null;
     if (!track) {
         if (windowsSpotifyTrack && Date.now() - windowsSpotifyTrackReceivedAt < WINDOWS_SPOTIFY_STATE_FRESH_MS) {
-            return windowsSpotifyTrack;
+            // Advance the position between polls instead of freezing it at the last sample.
+            const elapsed = windowsSpotifyTrack.isPlaying ? Date.now() - windowsSpotifyTrackReceivedAt : 0;
+            const progressMs = windowsSpotifyTrack.progressMs + elapsed;
+            return {
+                ...windowsSpotifyTrack,
+                progressMs: windowsSpotifyTrack.durationMs ? Math.min(progressMs, windowsSpotifyTrack.durationMs) : progressMs
+            };
         }
 
         if (
@@ -1384,7 +1158,7 @@ async function pollSpotifyPlayer(force = false) {
         tick();
     } catch (error) {
         debugLog(`spotify poll failed ${stringifyError(error)}`);
-        spotifyPollMutedUntil = Date.now() + 10000;
+        spotifyPollMutedUntil = Date.now() + SPOTIFY_POLL_ERROR_MUTE_MS;
     } finally {
         spotifyPollInFlight = false;
     }
@@ -1406,7 +1180,6 @@ function supportsSyncedLyrics(track: NormalizedTrack) {
 
 function clearProfileStatusForTrackChange() {
     lastStatusText = "";
-    nextRemoteStatusAt = 0;
     setRemoteStatus("", true);
     FluxDispatcher.dispatch({
         type: "LOCAL_ACTIVITY_UPDATE",
@@ -1520,14 +1293,21 @@ async function searchLyrics(track: NormalizedTrack): Promise<LrcLibResult | null
         const response = await nativeFetchJson<LrcLibResult[]>(`https://lrclib.net/api/search?${params}`);
         if (response.status < 200 || response.status >= 300 || !Array.isArray(response.data)) continue;
 
-        const match = response.data
+        const best = response.data
             .filter(result => result.syncedLyrics || result.synced_lyrics || (settings.store.usePlainLyricsFallback && result.plainLyrics))
-            .sort((a, b) => scoreLyricsResult(b, track) - scoreLyricsResult(a, track))[0];
+            .map(result => ({ result, score: scoreLyricsResult(result, track) }))
+            .sort((a, b) => b.score - a.score)[0];
 
-        if (match) return match;
+        // Needs a title match plus artist/duration evidence, so another song by the same artist isn't picked.
+        if (best && best.score >= 8) return best.result;
     }
 
     return null;
+}
+
+function lyricsCacheKey(track: NormalizedTrack) {
+    // Source-independent (Discord vs Windows data differ in id/duration) and aware of the plain-lyrics setting.
+    return `${cleanComparable(track.title)}|${cleanComparable(firstArtist(track.artist))}|${settings.store.usePlainLyricsFallback ? "plain" : "synced"}`;
 }
 
 async function loadLyrics(track: NormalizedTrack) {
@@ -1535,6 +1315,18 @@ async function loadLyrics(track: NormalizedTrack) {
     fetchController = new AbortController();
 
     const key = trackKey(track);
+    const cacheKey = lyricsCacheKey(track);
+    const cached = lyricsCache.get(cacheKey);
+    if (cached) {
+        setBounded(lyricsCache, cacheKey, cached, LYRICS_CACHE_LIMIT);
+        // Called synchronously from prepareTrack(); the caller's tick picks the lyrics up right away.
+        if (loadingTrackKey === key && key === lastTrackKey) {
+            lyrics = cached;
+            loadingTrackKey = "";
+        }
+        return;
+    }
+
     const params = new URLSearchParams({
         track_name: track.title,
         artist_name: track.artist
@@ -1554,6 +1346,7 @@ async function loadLyrics(track: NormalizedTrack) {
             ? synced
             : parsePlainLyrics(found?.plainLyrics ?? "", track.durationMs);
 
+        setBounded(lyricsCache, cacheKey, nextLyrics, LYRICS_CACHE_LIMIT);
         if (loadingTrackKey !== key || key !== lastTrackKey) return;
 
         lyrics = nextLyrics;
@@ -1576,13 +1369,15 @@ function scoreLyricsResult(result: LrcLibResult, track: NormalizedTrack) {
     const resultArtist = cleanComparable(result.artistName);
     const resultAlbum = cleanComparable(result.albumName);
     const title = cleanComparable(track.title);
-    const artist = cleanComparable(track.artist);
+    // firstArtist must run before cleanComparable, which strips the "," and "&" it splits on.
+    const artist = cleanComparable(firstArtist(track.artist));
     const album = cleanComparable(track.album);
 
-    if (resultTitle === title) score += 8;
-    else if (resultTitle.includes(title) || title.includes(resultTitle)) score += 4;
+    if (title && resultTitle === title) score += 8;
+    else if (title && resultTitle && (resultTitle.includes(title) || title.includes(resultTitle))) score += 4;
+    else return 0;
 
-    if (artist && resultArtist.includes(firstArtist(artist))) score += 4;
+    if (artist && resultArtist.includes(artist)) score += 4;
     if (album && resultAlbum === album) score += 2;
 
     if (track.durationMs && result.duration) {
@@ -1595,9 +1390,12 @@ function scoreLyricsResult(result: LrcLibResult, track: NormalizedTrack) {
 }
 
 function stripFeatureText(value: string) {
+    // "with" only inside brackets, so titles like "Song - With You" keep their words.
     return value
-        .replace(/\s*[-(]\s*(feat\.?|ft\.?|with)\s+[^)\]-]+[)\]]?/ig, "")
+        .replace(/\s*[([]\s*(feat\.?|ft\.?|with)\s+[^)\]]*[)\]]/ig, "")
+        .replace(/\s*-\s*(feat\.?|ft\.?)\s.*$/i, "")
         .replace(/\s*\([^)]*(remaster|sped up|slowed|nightcore|version)[^)]*\)/ig, "")
+        .replace(/\s*-\s*[^-]*(remaster|sped up|slowed|nightcore)[^-]*$/i, "")
         .trim();
 }
 
@@ -1624,8 +1422,40 @@ function getLyricChunkLimit() {
     }
 }
 
-function splitLyricChunks(text: string) {
+// Each page stays at least this long, so it survives the 1 s remote status rate limit and can be read.
+const MIN_PAGE_MS = 1200;
+const DISCORD_STATUS_MAX_LENGTH = 128;
+
+// The same line is split several times per tick (4 ticks/s); cache the last result.
+let lastChunkSplit: { text: string; maxLength: number; maxPages: number; chunks: string[]; } | undefined;
+
+// Splits a line into pages of roughly equal length ("40 + 7 chars" becomes "24 + 23"), so the tail isn't a
+// lone word. With maxPages, pages may grow past the bubble limit (up to 128) to fit in fewer pages.
+function splitLyricChunks(text: string, maxPages = Infinity) {
     const maxLength = Math.max(8, getLyricChunkLimit());
+    if (lastChunkSplit?.text === text && lastChunkSplit.maxLength === maxLength && lastChunkSplit.maxPages === maxPages) {
+        return lastChunkSplit.chunks;
+    }
+
+    let chunks = computeLyricChunks(text, maxLength);
+    if (chunks.length > 1) {
+        const pages = Math.max(1, Math.min(chunks.length, maxPages));
+        const widest = pages < chunks.length ? DISCORD_STATUS_MAX_LENGTH : maxLength;
+        const totalLength = [...cleanText(text)].length;
+        for (let width = Math.ceil(totalLength / pages); width <= widest; width++) {
+            const candidate = computeLyricChunks(text, width);
+            if (candidate.length <= pages) {
+                chunks = candidate;
+                break;
+            }
+        }
+    }
+
+    lastChunkSplit = { text, maxLength, maxPages, chunks };
+    return chunks;
+}
+
+function computeLyricChunks(text: string, maxLength: number) {
     const words = cleanText(text).split(" ").filter(Boolean);
     const chunks: string[] = [];
     let current = "";
@@ -1655,36 +1485,41 @@ function splitLyricChunks(text: string) {
     return chunks.length ? chunks : [cleanText(text)];
 }
 
-function chunkWeight(text: string) {
-    return Math.max(1, [...cleanText(text)].filter(char => char !== " ").length);
+function getGapThresholdMs() {
+    return Math.max(3000, getStoredNumber("gapThresholdMs", DEFAULT_SETTINGS.gapThresholdMs));
+}
+
+function estimatedPageCount(text: string) {
+    return Math.max(1, Math.ceil([...cleanText(text)].length / Math.max(8, getLyricChunkLimit())));
+}
+
+// Before a long instrumental gap the line is replaced by waiting dots; keep it up long enough to page through.
+function waitingDotsAfterMs(text: string, gapMs: number) {
+    return Math.min(gapMs - 250, Math.max(2600, estimatedPageCount(text) * (MIN_PAGE_MS + 400)));
+}
+
+// How long the line is actually on screen: until the next line, or until waiting dots take over.
+function lineDisplayMs(line: ActiveLyricLine) {
+    if (line.nextTimeMs === undefined) return Math.max(3000, estimatedPageCount(line.text) * 2200);
+
+    const gapMs = line.nextTimeMs - line.timeMs;
+    if (settings.store.showWaitingDots && gapMs >= getGapThresholdMs()) return waitingDotsAfterMs(line.text, gapMs);
+    return gapMs;
 }
 
 function lyricPageForStatus(line: ActiveLyricLine, progressMs: number) {
-    const chunks = splitLyricChunks(line.text);
-    if (chunks.length <= 1) return formatStatus(chunks[0]);
+    const displayMs = lineDisplayMs(line);
+    const maxPages = Math.max(1, Math.floor(displayMs / MIN_PAGE_MS));
+    const chunks = splitLyricChunks(line.text, maxPages);
+    const fitsBubble = chunks.every(chunk => [...chunk].length <= Math.max(8, getLyricChunkLimit()));
+    if (chunks.length <= 1) return formatStatus(chunks[0], true, fitsBubble);
 
-    const lyricOffsetMs = Math.max(0, getStoredNumber("lyricOffsetMs", DEFAULT_SETTINGS.lyricOffsetMs));
-    const lineDurationMs = Math.max(
-        chunks.length * 1500,
-        (line.nextTimeMs ?? line.timeMs + chunks.length * 2200) - line.timeMs
-    );
-    const elapsedMs = Math.max(0, progressMs - line.timeMs - lyricOffsetMs);
-    const totalWeight = chunks.reduce((total, chunk) => total + chunkWeight(chunk), 0);
-
-    let index = 0;
-    let elapsedWeight = 0;
-
-    for (let chunkIndex = 1; chunkIndex < chunks.length; chunkIndex++) {
-        elapsedWeight += chunkWeight(chunks[chunkIndex - 1]);
-
-        const sungThreshold = lineDurationMs * elapsedWeight / totalWeight;
-        const readThreshold = chunkIndex * 1300;
-        if (elapsedMs >= Math.max(sungThreshold, readThreshold)) {
-            index = chunkIndex;
-        }
-    }
-
-    return formatStatus(chunks[index]);
+    // progressMs already includes lyricOffsetMs, and so does the moment the line appeared, so time on screen is
+    // simply progress - line start. (The original also subtracted the offset here, which cut the last 650 ms of
+    // every line's page schedule; together with weight-based timing that pushed the last page into that cut.)
+    const elapsedMs = Math.max(0, progressMs - line.timeMs);
+    const index = Math.min(chunks.length - 1, Math.floor(elapsedMs / (displayMs / chunks.length)));
+    return formatStatus(chunks[index], true, fitsBubble);
 }
 
 function lyricAt(progressMs: number): ActiveLyricLine | undefined {
@@ -1710,14 +1545,10 @@ function lyricAt(progressMs: number): ActiveLyricLine | undefined {
 
     const line = lyrics[current];
     const nextLine = lyrics[current + 1];
-    const gapThresholdMs = Math.max(3000, getStoredNumber("gapThresholdMs", DEFAULT_SETTINGS.gapThresholdMs));
-
     if (settings.store.showWaitingDots && nextLine) {
         const gapMs = nextLine.timeMs - line.timeMs;
-        if (gapMs >= gapThresholdMs) {
-            const chunks = splitLyricChunks(line.text);
-            const holdMs = Math.min(gapMs - 250, Math.max(2600, chunks.length * 900));
-            if (progressMs >= line.timeMs + holdMs) return undefined;
+        if (gapMs >= getGapThresholdMs() && progressMs >= line.timeMs + waitingDotsAfterMs(line.text, gapMs)) {
+            return undefined;
         }
     }
 
@@ -1729,7 +1560,7 @@ function lyricAt(progressMs: number): ActiveLyricLine | undefined {
 
 function tick() {
     void pollSpotifyPlayer();
-    void pollWindowsSpotifyState();
+    if (!discordHasSpotifyData()) void pollWindowsSpotifyState();
 
     const track = getCurrentTrack();
 
@@ -1827,10 +1658,9 @@ export default definePlugin({
     name: "DiscordLyrics",
     description: "Sets your profile status to synced Spotify lyrics and shows a Spotify song RPC.",
     authors: [pluginAuthor],
-    tags: ["Spotify", "Media"],
+    tags: ["Media"],
     dependencies: ["SpotifyControls", "UserSettingsAPI"],
     settings,
-    settingsAboutComponent: UpdateSettingsControl,
 
     start() {
         updatePluginAuthor();
@@ -1841,11 +1671,6 @@ export default definePlugin({
         logStatusUserSettings();
         setRemoteStatus("");
         void pollSpotifyPlayer(true);
-        void pollWindowsSpotifyState(true);
-        window.setTimeout(() => void pollWindowsSpotifyState(true), 2000);
-        window.setTimeout(() => void pollWindowsSpotifyState(true), 5000);
-        window.setTimeout(() => void showPendingUpdateNotice(), 2500);
-        window.setTimeout(() => void checkForDiscordLyricsUpdateOnStartup(), 7000);
         tick();
         showToast("DiscordLyrics started", Toasts.Type.SUCCESS);
     },
@@ -1860,6 +1685,9 @@ export default definePlugin({
         window.removeEventListener("pagehide", clearStatusForShutdown);
         fetchController?.abort();
         fetchController = undefined;
+        void (Native?.stopWindowsSpotifyWatcher?.() as Promise<void> | undefined)?.catch(() => void 0);
+        statusSettingCache.clear();
+        statusExpiryCleared = false;
         spotifyState = undefined;
         windowsSpotifyTrack = undefined;
         windowsSpotifyTrackReceivedAt = 0;

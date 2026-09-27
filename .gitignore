@@ -1,7 +1,0 @@
-spotify-lyrics-debug.log
-*.log
-node_modules/
-.env
-.DS_Store
-Thumbs.db
-dist/package/

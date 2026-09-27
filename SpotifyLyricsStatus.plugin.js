@@ -1,69 +1,120 @@
-﻿/**
+/**
  * @name DiscordLyrics
- * @author mally
+ * @author mally (personal build)
  * @description Sets your Discord custom status to the current synced lyric from Spotify, or a pause status when playback stops.
- * @version 1.0.6
- * @source https://lrclib.net
+ * @version 1.0.6-personal.1
+ * @source https://github.com/MallyDev2/DiscordLyrics
  */
 
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const { execFile, spawn } = require("child_process");
+const { spawn } = require("child_process");
+
+const DEFAULT_SETTINGS = {
+    pausedPrefix: "⏸ Pause - ",
+    noLyricsPrefix: "♫ ",
+    lyricOffsetMs: 0,
+    windowsMediaFallback: true
+};
+
+const CONFIG = {
+    tickMs: 1000,
+    statusMinIntervalMs: 1000,
+    statusResyncMs: 30000,
+    statusErrorBackoffMs: 5000,
+    maxStatusLength: 128,
+    lyricsFetchTimeoutMs: 15000,
+    lyricsCacheSize: 50,
+    windowsTrackFreshMs: 5000,
+    windowsProcessGraceMs: 15000,
+    windowsWatcherIdleMs: 60000,
+    windowsWatcherWarmupMs: 5000,
+    lastKnownTrackMs: 30 * 60 * 1000
+};
+
+// Long-lived watcher: one PowerShell process that prints the Spotify media session as a JSON line every second,
+// instead of spawning a fresh PowerShell every poll. The position is extrapolated from LastUpdatedTime because
+// Spotify only refreshes the timeline every few seconds.
+const WINDOWS_MEDIA_SCRIPT = String.raw`
+$ErrorActionPreference = "SilentlyContinue"
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod } | Select-Object -First 1
+function Await($Operation, [Type]$ResultType) {
+  $asTaskGeneric.MakeGenericMethod($ResultType).Invoke($null, @($Operation)).GetAwaiter().GetResult()
+}
+$managerType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime]
+$propsType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime]
+$manager = $null
+try { $manager = Await ($managerType::RequestAsync()) $managerType } catch {}
+while ($true) {
+  $track = $null
+  if ($manager) {
+    try {
+      foreach ($session in $manager.GetSessions()) {
+        if (($session.SourceAppUserModelId -as [string]) -notmatch "Spotify") { continue }
+        $props = Await ($session.TryGetMediaPropertiesAsync()) $propsType
+        if (-not $props.Title) { continue }
+        $timeline = $session.GetTimelineProperties()
+        $status = $session.GetPlaybackInfo().PlaybackStatus.ToString()
+        $position = $timeline.Position.TotalMilliseconds
+        if ($status -eq "Playing" -and $timeline.LastUpdatedTime.Year -gt 2000) {
+          $position += ([DateTimeOffset]::UtcNow - $timeline.LastUpdatedTime).TotalMilliseconds
+        }
+        $duration = $timeline.EndTime.TotalMilliseconds
+        if ($duration -gt 0 -and $position -gt $duration) { $position = $duration }
+        $track = [ordered]@{
+          title = $props.Title
+          artist = $props.Artist
+          album = $props.AlbumTitle
+          status = $status
+          positionMs = [int64][math]::Max(0, $position)
+          durationMs = [int64][math]::Max(0, $duration)
+        }
+        break
+      }
+    } catch {}
+  }
+  $running = [bool]$track
+  if (-not $running) { $running = [bool](Get-Process -Name Spotify -ErrorAction SilentlyContinue | Select-Object -First 1) }
+  $json = [ordered]@{ processRunning = $running; track = $track } | ConvertTo-Json -Compress
+  try { [Console]::Out.WriteLine($json); [Console]::Out.Flush() } catch { exit }
+  Start-Sleep -Milliseconds 1000
+}
+`;
 
 module.exports = class DiscordLyrics {
-    constructor() {
+    constructor(meta) {
         this.name = "DiscordLyrics";
-        this.version = "1.0.6";
-        this.repo = "MallyDev2/DiscordLyrics";
-        this.latestReleaseApi = `https://api.github.com/repos/${this.repo}/releases/latest`;
+        this.version = meta?.version || "1.0.6-personal.1";
+        this.settings = { ...DEFAULT_SETTINGS, ...(BdApi.Data.load(this.name, "settings") || {}) };
+        this.lyricsCache = new Map();
+        this.shutdownHandler = () => this.clearStatusForShutdown();
+        this.resetState();
+    }
+
+    resetState() {
         this.interval = null;
-        this.lastStatus = null;
-        this.lastTrackKey = null;
-        this.pauseTrack = null;
-        this.windowsSpotifyTrack = null;
-        this.windowsSpotifyTrackAt = 0;
-        this.windowsSpotifyProcessRunning = false;
-        this.windowsSpotifyProcessSeenAt = 0;
-        this.windowsSpotifyPollAt = 0;
-        this.windowsSpotifyPollInFlight = false;
-        this.lastKnownTrack = null;
-        this.lastKnownTrackAt = 0;
-        this.lyrics = [];
-        this.lyricsSource = null;
-        this.fetchController = null;
-        this.statusCooldownUntil = 0;
+        this.tickRunning = false;
         this.spotifyState = null;
         this.spotifyStateListener = null;
-        this.lastStatusExpiresAt = 0;
-        this.lastRemoteStatus = null;
-        this.lastForcedStatusAt = 0;
-        this.spotifyUnavailableAt = 0;
-        this.lastUpdateCheckedAt = Number(BdApi.Data.load(this.name, "lastUpdateCheckedAt") || 0);
-        this.latestVersion = BdApi.Data.load(this.name, "latestVersion") || "";
-        this.autoUpdateChecked = false;
-        this.stateDir = path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "DiscordLyrics");
-        this.installProfilePath = path.join(this.stateDir, "install-profile.json");
-        this.pendingUpdatePath = path.join(this.stateDir, "pending-update.json");
-        this.updateNotesPath = path.join(this.stateDir, "update-notes.txt");
-        this.updateInstallerPath = path.join(this.stateDir, "DiscordLyrics-Installer.ps1");
-        this.updateUiPath = path.join(this.stateDir, "DiscordLyrics-Installer.exe");
-        this.updateLogPath = path.join(this.stateDir, "update-install.log");
-        this.pendingUpdateNoticeOpen = false;
-        this.shutdownHandler = () => this.clearStatusForShutdown();
-
-        this.config = {
-            tickMs: 1000,
-            statusMinMs: 1000,
-            lyricLeadMs: 0,
-            maxStatusLength: 128,
-            pausedPrefix: "\u23f8 Pause - ",
-            noLyricsPrefix: "\u266b ",
-            clearWhenNoSong: true,
-            windowsSpotifyPollMs: 2000,
-            windowsSpotifyFreshMs: 10000,
-            windowsSpotifyProcessGraceMs: 15000,
-            lastKnownTrackMs: 1800000
+        this.lastTrackKey = null;
+        this.lyrics = [];
+        this.fetchController = null;
+        this.lastStatus = null;
+        this.lastStatusSentAt = 0;
+        this.statusCooldownUntil = 0;
+        this.statusInFlight = false;
+        this.lastKnownTrack = null;
+        this.lastKnownTrackAt = 0;
+        this.windows = {
+            child: null,
+            startedAt: 0,
+            track: null,
+            receivedAt: 0,
+            processRunning: false,
+            processSeenAt: 0,
+            wantedAt: 0,
+            restarts: 0,
+            restartTimer: null
         };
     }
 
@@ -72,55 +123,35 @@ module.exports = class DiscordLyrics {
         this.subscribeSpotifyState();
         window.addEventListener("beforeunload", this.shutdownHandler);
         window.addEventListener("pagehide", this.shutdownHandler);
-        this.interval = setInterval(() => this.tick(), this.config.tickMs);
-        setTimeout(() => this.showPendingUpdateNotice(), 2500);
+        this.interval = setInterval(() => this.tick(), CONFIG.tickMs);
         this.tick();
-        setTimeout(() => this.pollWindowsSpotifyState(true), 1000);
-        setTimeout(() => this.pollWindowsSpotifyState(true), 3000);
-        setTimeout(() => this.checkForUpdatesOnStartup(), 7000);
         BdApi.showToast("DiscordLyrics started", { type: "success" });
     }
 
     stop() {
         clearInterval(this.interval);
-        this.interval = null;
-
-        if (this.fetchController) this.fetchController.abort();
-        this.fetchController = null;
+        this.fetchController?.abort();
         this.unsubscribeSpotifyState();
+        this.stopWindowsWatcher();
         window.removeEventListener("beforeunload", this.shutdownHandler);
         window.removeEventListener("pagehide", this.shutdownHandler);
-
-        this.lyrics = [];
-        this.lastTrackKey = null;
-        this.lastStatus = null;
-        this.lastRemoteStatus = null;
-        this.lastForcedStatusAt = 0;
-        this.pauseTrack = null;
-        this.windowsSpotifyTrack = null;
-        this.windowsSpotifyTrackAt = 0;
-        this.lastKnownTrack = null;
-        this.lastKnownTrackAt = 0;
-        this.spotifyState = null;
-
         this.clearStatusForShutdown();
+        this.resetState();
         BdApi.showToast("DiscordLyrics stopped", { type: "info" });
     }
 
-    clearStatusForShutdown = () => {
-        this.lastStatus = null;
-        this.pauseTrack = null;
+    clearStatusForShutdown() {
         void this.setCustomStatus("", true).catch(() => void 0);
-    };
+    }
+
+    saveSettings() {
+        BdApi.Data.save(this.name, "settings", this.settings);
+    }
 
     findModules() {
         const wp = BdApi.Webpack;
         this.PresenceStore = wp.getStore?.("PresenceStore")
             || wp.getModule(m => m?.getLocalPresence && m?.getState);
-
-        this.UserStore = wp.getStore?.("UserStore")
-            || wp.getModule(m => m?.getCurrentUser && m?.getUser);
-
         this.HTTP = wp.getModule(wp.Filters.byProps("patch", "get", "post"));
         this.FluxDispatcher = wp.getModule(wp.Filters.byProps("subscribe", "unsubscribe", "dispatch"));
     }
@@ -129,20 +160,13 @@ module.exports = class DiscordLyrics {
         if (!this.FluxDispatcher?.subscribe || this.spotifyStateListener) return;
 
         this.spotifyStateListener = event => {
-            if (!event?.track) {
-                this.spotifyState = null;
-                this.spotifyUnavailableAt = Date.now();
-                this.handleClosedOrIdle();
-                return;
-            }
-
-            this.spotifyUnavailableAt = 0;
-            this.spotifyState = {
+            this.spotifyState = event?.track ? {
                 track: event.track,
                 isPlaying: Boolean(event.isPlaying),
                 position: Number(event.position || 0),
                 updatedAt: Date.now()
-            };
+            } : null;
+            void this.tick();
         };
 
         this.FluxDispatcher.subscribe("SPOTIFY_PLAYER_STATE", this.spotifyStateListener);
@@ -155,83 +179,85 @@ module.exports = class DiscordLyrics {
     }
 
     async tick() {
+        if (this.tickRunning) return;
+        this.tickRunning = true;
+
         try {
-            this.pollWindowsSpotifyState();
+            this.stopIdleWindowsWatcher();
+            const track = this.getCurrentTrack();
 
-            const stateTrack = this.trackFromSpotifyState();
-            if (stateTrack) {
-                if (!stateTrack.isPlaying) {
-                    this.pauseTrack = stateTrack;
-                    await this.handlePausedTrack(stateTrack);
-                    return;
-                }
-
-                await this.handlePlayingTrack(stateTrack);
-                return;
+            if (track === undefined) return; // Windows watcher is still warming up; keep the current status.
+            if (!track) {
+                this.lastTrackKey = null;
+                this.lyrics = [];
+                await this.setCustomStatus("");
+            } else if (!track.isPlaying) {
+                await this.setCustomStatus(`${this.settings.pausedPrefix}${track.title}`);
+            } else {
+                await this.handlePlayingTrack(track);
             }
-
-            const activity = this.getSpotifyActivity();
-
-            if (!activity) {
-                const windowsTrack = this.getWindowsSpotifyTrack();
-                if (windowsTrack) {
-                    if (!windowsTrack.isPlaying) {
-                        this.pauseTrack = windowsTrack;
-                        await this.handlePausedTrack(windowsTrack);
-                    } else {
-                        await this.handlePlayingTrack(windowsTrack);
-                    }
-                    return;
-                }
-
-                if (
-                    (this.windowsSpotifyProcessRunning || Date.now() - this.windowsSpotifyProcessSeenAt < this.config.windowsSpotifyProcessGraceMs)
-                    && this.lastKnownTrack
-                    && Date.now() - this.lastKnownTrackAt < this.config.lastKnownTrackMs
-                ) {
-                    await this.handlePausedTrack({ ...this.lastKnownTrack, isPlaying: false });
-                    return;
-                }
-
-                await this.handleClosedOrIdle();
-                return;
-            }
-
-            const track = this.trackFromActivity(activity);
-            if (!track?.title || !track?.artist) return;
-
-            await this.handlePlayingTrack(track);
         } catch (error) {
-            console.error("[SpotifyLyricsStatus]", error);
+            console.error("[DiscordLyrics]", error);
+        } finally {
+            this.tickRunning = false;
         }
     }
 
+    // Returns a track, null when nothing is playing, or undefined when the answer isn't known yet.
+    getCurrentTrack() {
+        const stateTrack = this.trackFromSpotifyState();
+        if (stateTrack) return this.rememberTrack(stateTrack);
+
+        const activity = this.getSpotifyActivity();
+        if (activity) {
+            const track = this.trackFromActivity(activity);
+            if (track.title && track.artist) return this.rememberTrack(track);
+        }
+
+        if (process.platform !== "win32" || !this.settings.windowsMediaFallback) return null;
+
+        const windowsTrack = this.getWindowsTrack();
+        if (windowsTrack) return windowsTrack;
+        if (this.isWindowsWatcherWarmingUp()) return undefined;
+
+        const spotifyRunning = this.windows.processRunning
+            || Date.now() - this.windows.processSeenAt < CONFIG.windowsProcessGraceMs;
+        if (spotifyRunning && this.lastKnownTrack && Date.now() - this.lastKnownTrackAt < CONFIG.lastKnownTrackMs) {
+            return { ...this.lastKnownTrack, isPlaying: false };
+        }
+
+        return null;
+    }
+
     async handlePlayingTrack(track) {
-        this.pauseTrack = track;
         const trackKey = this.getTrackKey(track);
 
         if (trackKey !== this.lastTrackKey) {
             this.lastTrackKey = trackKey;
-            this.lastStatus = null;
             this.lyrics = [];
-            this.lyricsSource = null;
-            this.loadLyrics(track);
+            void this.loadLyrics(track, trackKey);
         }
 
-        const line = this.getCurrentLyric(track.progressMs);
-        const status = line || `${this.config.noLyricsPrefix}${track.title} - ${track.artist}`;
+        const line = this.getCurrentLyric(track.progressMs + Number(this.settings.lyricOffsetMs || 0));
+        const status = line || `${this.settings.noLyricsPrefix}${track.title} - ${track.artist}`;
         await this.setCustomStatus(status);
     }
 
     getSpotifyActivity() {
-        const localPresence = this.PresenceStore?.getLocalPresence?.()
-            || this.PresenceStore?.getState?.()?.localPresence;
+        const activities = this.getLocalPresence()?.activities || [];
+        return activities.find(activity => activity?.type === 2 && (
+            String(activity.name || "").toLowerCase() === "spotify"
+            || String(activity.party?.id || "").startsWith("spotify:")
+        ));
+    }
 
-        const activities = localPresence?.activities || [];
-        return activities.find(activity => {
-            const name = String(activity?.name || "").toLowerCase();
-            return activity?.type === 2 || name === "spotify";
-        });
+    getLocalPresence() {
+        try {
+            return this.PresenceStore?.getLocalPresence?.()
+                || this.PresenceStore?.getState?.()?.localPresence;
+        } catch {
+            return null;
+        }
     }
 
     trackFromSpotifyState() {
@@ -241,73 +267,34 @@ module.exports = class DiscordLyrics {
         const artist = Array.isArray(track.artists)
             ? track.artists.map(item => item?.name).filter(Boolean).join(", ")
             : "";
-        const progressMs = position + (isPlaying ? Date.now() - updatedAt : 0) + this.config.lyricLeadMs;
+        const durationMs = this.normalizeDurationMs(track.duration_ms ?? track.duration);
+        const progressMs = position + (isPlaying ? Date.now() - updatedAt : 0);
+
+        // Discord stopped sending updates long ago; the extrapolated position ran past the end of the song.
+        if (isPlaying && durationMs && progressMs > durationMs + 10000) return null;
 
         return {
             title: this.cleanText(track.name),
             artist: this.cleanText(artist),
             album: this.cleanText(track.album?.name),
-            syncId: track.id || "",
-            durationMs: this.normalizeDurationMs(track.duration_ms ?? track.duration),
+            durationMs,
             progressMs: Math.max(0, progressMs),
             isPlaying
         };
     }
 
     trackFromActivity(activity) {
-        const title = activity.details || activity.name;
-        const artist = activity.state || "";
-        const album = activity.assets?.large_text || "";
-        const syncId = activity.sync_id || activity.metadata?.spotify_id || "";
         const startedAt = activity.timestamps?.start || null;
         const endsAt = activity.timestamps?.end || null;
-        const now = Date.now();
-        const durationMs = startedAt && endsAt ? Math.max(0, endsAt - startedAt) : 0;
-        const progressMs = startedAt ? Math.max(0, now - startedAt + this.config.lyricLeadMs) : 0;
 
         return {
-            title: this.cleanText(title),
-            artist: this.cleanText(artist),
-            album: this.cleanText(album),
-            syncId,
-            durationMs: this.normalizeDurationMs(durationMs),
-            progressMs,
+            title: this.cleanText(activity.details || activity.name),
+            artist: this.cleanText(activity.state),
+            album: this.cleanText(activity.assets?.large_text),
+            durationMs: this.normalizeDurationMs(startedAt && endsAt ? Math.max(0, endsAt - startedAt) : 0),
+            progressMs: startedAt ? Math.max(0, Date.now() - startedAt) : 0,
             isPlaying: true
         };
-    }
-
-    getWindowsSpotifyTrack() {
-        return this.windowsSpotifyTrack && Date.now() - this.windowsSpotifyTrackAt < this.config.windowsSpotifyFreshMs
-            ? this.windowsSpotifyTrack
-            : null;
-    }
-
-    normalizeWindowsSpotifyTrack(state) {
-        const media = state?.track;
-        const title = this.cleanText(media?.title);
-        if (!title) return null;
-
-        const fallback = this.findLastKnownTrack(title, media?.artist);
-        return this.rememberTrack({
-            title,
-            artist: this.cleanText(media?.artist),
-            album: this.cleanText(media?.album) || fallback?.album || "",
-            syncId: fallback?.syncId || "",
-            durationMs: this.normalizeDurationMs(media?.durationMs) || fallback?.durationMs || 0,
-            progressMs: Math.max(0, Number(media?.positionMs || 0) + this.config.lyricLeadMs),
-            isPlaying: this.cleanText(media?.status).toLowerCase() === "playing"
-        });
-    }
-
-    findLastKnownTrack(title, artist) {
-        if (!this.lastKnownTrack) return null;
-        if (this.comparable(title) !== this.comparable(this.lastKnownTrack.title)) return null;
-
-        const mediaArtist = this.comparable(this.firstArtist(artist));
-        const knownArtist = this.comparable(this.firstArtist(this.lastKnownTrack.artist));
-        if (mediaArtist && knownArtist && mediaArtist !== knownArtist) return null;
-
-        return this.lastKnownTrack;
     }
 
     rememberTrack(track) {
@@ -317,394 +304,272 @@ module.exports = class DiscordLyrics {
         return track;
     }
 
-    async handlePausedTrack(track) {
-        this.lastTrackKey = null;
-        this.lyrics = [];
+    findLastKnownTrack(title, artist) {
+        if (!this.lastKnownTrack) return null;
 
-        if (track?.title) {
-            await this.setCustomStatus(`${this.config.pausedPrefix}${track.title}`, true);
+        const mediaTitle = this.comparable(title);
+        if (!mediaTitle || mediaTitle !== this.comparable(this.lastKnownTrack.title)) return null;
+
+        const mediaArtist = this.comparable(this.firstArtist(artist));
+        const knownArtist = this.comparable(this.firstArtist(this.lastKnownTrack.artist));
+        if (mediaArtist && knownArtist && mediaArtist !== knownArtist) return null;
+
+        return this.lastKnownTrack;
+    }
+
+    // ---- Windows media fallback ----
+
+    getWindowsTrack() {
+        const w = this.windows;
+        w.wantedAt = Date.now();
+        this.ensureWindowsWatcher();
+
+        if (!w.track || Date.now() - w.receivedAt > CONFIG.windowsTrackFreshMs) return null;
+
+        const elapsed = w.track.isPlaying ? Date.now() - w.receivedAt : 0;
+        const progressMs = w.track.progressMs + elapsed;
+        return {
+            ...w.track,
+            progressMs: w.track.durationMs ? Math.min(progressMs, w.track.durationMs) : progressMs
+        };
+    }
+
+    isWindowsWatcherWarmingUp() {
+        const w = this.windows;
+        return Boolean(w.child) && !w.receivedAt && Date.now() - w.startedAt < CONFIG.windowsWatcherWarmupMs;
+    }
+
+    ensureWindowsWatcher() {
+        const w = this.windows;
+        if (w.child || w.restartTimer) return;
+
+        let child;
+        try {
+            child = spawn("powershell.exe", [
+                "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-EncodedCommand", Buffer.from(WINDOWS_MEDIA_SCRIPT, "utf16le").toString("base64")
+            ], {
+                windowsHide: true,
+                stdio: ["ignore", "pipe", "ignore"]
+            });
+        } catch (error) {
+            console.warn("[DiscordLyrics] Could not start Windows media watcher", error);
+            this.scheduleWindowsWatcherRestart();
             return;
         }
 
-        await this.setCustomStatus("");
-    }
+        w.child = child;
+        w.startedAt = Date.now();
+        w.receivedAt = 0;
 
-    pollWindowsSpotifyState(force = false) {
-        if (process.platform !== "win32") return;
-        if (this.windowsSpotifyPollInFlight) return;
-        if (!force && Date.now() - this.windowsSpotifyPollAt < this.config.windowsSpotifyPollMs) return;
-
-        this.windowsSpotifyPollInFlight = true;
-        this.windowsSpotifyPollAt = Date.now();
-
-        const script = `
-$ErrorActionPreference = "SilentlyContinue"
-$processRunning = [bool](Get-Process Spotify -ErrorAction SilentlyContinue | Select-Object -First 1)
-$track = $null
-try {
-  Add-Type -AssemblyName System.Runtime.WindowsRuntime
-  function Await($AsyncOperation, $ResultType) {
-    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod })[0]
-    $task = $asTask.MakeGenericMethod($ResultType).Invoke($null, @($AsyncOperation))
-    return $task.GetAwaiter().GetResult()
-  }
-  [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
-  [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime] | Out-Null
-  $manager = Await ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
-  foreach ($session in $manager.GetSessions()) {
-    if (($session.SourceAppUserModelId -as [string]) -notmatch "Spotify") { continue }
-    $props = Await ($session.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
-    $timeline = $session.GetTimelineProperties()
-    if ($props.Title) {
-      $track = [pscustomobject]@{
-        title = $props.Title
-        artist = $props.Artist
-        album = $props.AlbumTitle
-        status = $session.GetPlaybackInfo().PlaybackStatus.ToString()
-        positionMs = [math]::Max(0, [int64]$timeline.Position.TotalMilliseconds)
-        durationMs = [math]::Max(0, [int64]$timeline.EndTime.TotalMilliseconds)
-      }
-      break
-    }
-  }
-} catch {}
-[pscustomobject]@{ processRunning = $processRunning; track = $track } | ConvertTo-Json -Compress
-`;
-
-        execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
-            windowsHide: true,
-            timeout: 2500,
-            maxBuffer: 64 * 1024
-        }, (error, stdout) => {
-            this.windowsSpotifyPollInFlight = false;
-            if (error) return;
-
-            try {
-                const state = JSON.parse(String(stdout || "{\"processRunning\":false,\"track\":null}").trim());
-                this.windowsSpotifyProcessRunning = Boolean(state?.processRunning);
-                if (this.windowsSpotifyProcessRunning) this.windowsSpotifyProcessSeenAt = Date.now();
-
-                const track = this.normalizeWindowsSpotifyTrack(state);
-                if (track) {
-                    this.windowsSpotifyTrack = track;
-                    this.windowsSpotifyTrackAt = Date.now();
-                    this.spotifyUnavailableAt = 0;
-                } else if (!this.windowsSpotifyProcessRunning && Date.now() - this.windowsSpotifyProcessSeenAt > this.config.windowsSpotifyProcessGraceMs) {
-                    this.windowsSpotifyTrack = null;
-                    this.windowsSpotifyTrackAt = 0;
-                }
-            } catch (parseError) {
-                console.warn("[SpotifyLyricsStatus] Could not read Windows Spotify state", parseError);
+        let buffer = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", chunk => {
+            buffer += chunk;
+            let index;
+            while ((index = buffer.indexOf("\n")) >= 0) {
+                const line = buffer.slice(0, index).replace(/^\uFEFF/, "").trim();
+                buffer = buffer.slice(index + 1);
+                if (line) this.onWindowsMediaState(line);
             }
+            if (buffer.length > 64 * 1024) buffer = "";
         });
+
+        const onGone = () => {
+            if (w.child !== child) return;
+            w.child = null;
+            this.scheduleWindowsWatcherRestart();
+        };
+        child.on("exit", onGone);
+        child.on("error", onGone);
     }
 
-    async handleClosedOrIdle() {
-        this.lastTrackKey = null;
-        this.lyrics = [];
-        this.pauseTrack = null;
-        await this.setCustomStatus("");
+    scheduleWindowsWatcherRestart() {
+        const w = this.windows;
+        if (w.restartTimer || !this.interval) return;
+        const delay = Math.min(60000, 2000 * 2 ** Math.min(w.restarts, 5));
+        w.restarts++;
+        w.restartTimer = setTimeout(() => {
+            w.restartTimer = null;
+            if (Date.now() - w.wantedAt < CONFIG.windowsWatcherIdleMs) this.ensureWindowsWatcher();
+        }, delay);
     }
 
-    async checkForUpdatesOnStartup() {
-        if (this.autoUpdateChecked) return;
-        this.autoUpdateChecked = true;
-        await this.checkForUpdates({ silentIfCurrent: true });
-    }
-
-    async fetchLatestRelease() {
-        const response = await fetch(this.latestReleaseApi, {
-            headers: {
-                Accept: "application/vnd.github+json",
-                "User-Agent": "DiscordLyrics"
-            }
-        });
-        if (!response.ok) throw new Error(`Release lookup returned ${response.status}`);
-        return response.json();
-    }
-
-    async checkForUpdates(options = {}) {
-        this.lastUpdateCheckedAt = Date.now();
-        BdApi.Data.save(this.name, "lastUpdateCheckedAt", this.lastUpdateCheckedAt);
-
-        try {
-            const release = await this.fetchLatestRelease();
-            const latest = this.normalizeVersion(release.tag_name || release.name || "");
-            this.latestVersion = latest || this.version;
-            BdApi.Data.save(this.name, "latestVersion", this.latestVersion);
-
-            if (!latest || this.compareVersions(latest, this.version) <= 0) {
-                if (!options.silentIfCurrent) BdApi.showToast("DiscordLyrics is up to date", { type: "success" });
-                return { latest: this.latestVersion, checkedAt: this.lastUpdateCheckedAt };
-            }
-
-            this.showUpdateFoundModal(latest, release);
-            return { latest, checkedAt: this.lastUpdateCheckedAt };
-        } catch (error) {
-            console.warn("[SpotifyLyricsStatus] Update check failed", error);
-            if (!options.silentIfCurrent) BdApi.showToast("DiscordLyrics update check failed", { type: "error" });
-            return { latest: "", checkedAt: this.lastUpdateCheckedAt };
+    stopIdleWindowsWatcher() {
+        if (this.windows.child && Date.now() - this.windows.wantedAt > CONFIG.windowsWatcherIdleMs) {
+            this.stopWindowsWatcher();
         }
     }
 
-    showUpdateFoundModal(version, release) {
-        const theme = this.getThemeStyles();
-        BdApi.UI.showConfirmationModal(
-            "Update found",
-            BdApi.React.createElement("div", {
-                style: {
-                    display: "grid",
-                    gap: "10px",
-                    maxHeight: "280px",
-                    overflow: "auto",
-                    color: theme.text
-                }
-            },
-                BdApi.React.createElement("div", null, `DiscordLyrics ${version} is available. Install it and restart Discord?`),
-                BdApi.React.createElement("strong", { style: { color: theme.heading } }, "What's new"),
-                BdApi.React.createElement("div", { style: { display: "grid", gap: "8px" } }, this.renderReleaseNotes(release.body || "")),
-                BdApi.React.createElement("div", { style: { color: theme.muted, fontSize: "12px" } }, release.html_url || `https://github.com/${this.repo}/releases/latest`)
-            ),
-            {
-                confirmText: "Install and restart",
-                cancelText: "Later",
-                onConfirm: () => this.installUpdate(version, release.body || "")
-            }
-        );
-    }
-
-    async installUpdate(version, body) {
+    stopWindowsWatcher() {
+        const w = this.windows;
+        clearTimeout(w.restartTimer);
+        w.restartTimer = null;
+        const child = w.child;
+        w.child = null;
+        w.track = null;
+        w.receivedAt = 0;
         try {
-            fs.mkdirSync(this.stateDir, { recursive: true });
-            fs.rmSync(this.pendingUpdatePath, { force: true });
-            fs.writeFileSync(this.updateNotesPath, String(body || ""), "utf8");
-            fs.writeFileSync(this.updateLogPath, `DiscordLyrics update started ${new Date().toISOString()}\n`, "utf8");
-
-            let profile = {};
-            try {
-                profile = JSON.parse(fs.readFileSync(this.installProfilePath, "utf8"));
-            } catch {
-                profile = {};
-            }
-
-            const response = await fetch(`https://github.com/${this.repo}/releases/latest/download/DiscordLyrics-Installer.ps1`);
-            if (!response.ok) throw new Error(`Installer download returned ${response.status}`);
-            fs.writeFileSync(this.updateInstallerPath, await response.text(), "utf8");
-            fs.appendFileSync(this.updateLogPath, `Installer script downloaded ${new Date().toISOString()}\n`);
-
-            const uiResponse = await fetch(`https://github.com/${this.repo}/releases/latest/download/DiscordLyrics-Installer.exe`);
-            if (!uiResponse.ok) throw new Error(`Installer UI download returned ${uiResponse.status}`);
-            const safeVersion = String(version || "update").replace(/[^0-9A-Za-z._-]+/g, "_");
-            const updateUiRunPath = path.join(this.stateDir, `DiscordLyrics-Installer-${safeVersion}-${Date.now()}.exe`);
-            fs.rmSync(this.updateUiPath, { force: true });
-            fs.writeFileSync(updateUiRunPath, Buffer.from(await uiResponse.arrayBuffer()));
-            fs.appendFileSync(this.updateLogPath, `Installer UI downloaded ${new Date().toISOString()} ${updateUiRunPath}\n`);
-
-            const updateUiArgs = [
-                "-UpdateMode",
-                "-Target", "BetterDiscord",
-                "-UpdateVersion", String(version || ""),
-                "-UpdateNotesPath", this.updateNotesPath
-            ];
-
-            if (profile.sourcePath) updateUiArgs.push("-SourcePath", profile.sourcePath);
-
-            fs.appendFileSync(this.updateLogPath, `Installer UI launching ${new Date().toISOString()} ${updateUiRunPath} ${JSON.stringify(updateUiArgs)}\n`);
-
-            const child = spawn(updateUiRunPath, updateUiArgs, {
-                detached: true,
-                windowsHide: true,
-                stdio: "ignore"
-            });
-
-            child.unref();
-
-            BdApi.showToast("DiscordLyrics update started", { type: "info" });
-        } catch (error) {
-            console.warn("[SpotifyLyricsStatus] Update install failed", error);
-            BdApi.showToast("DiscordLyrics update could not start", { type: "error" });
-        }
-    }
-
-    showPendingUpdateNotice(attempt = 1) {
-        try {
-            if (this.pendingUpdateNoticeOpen) return;
-            if (!fs.existsSync(this.pendingUpdatePath)) {
-                if (attempt < 6) setTimeout(() => this.showPendingUpdateNotice(attempt + 1), 5000);
-                return;
-            }
-            const notice = JSON.parse(fs.readFileSync(this.pendingUpdatePath, "utf8").replace(/^\uFEFF/, ""));
-            if (!notice?.version) {
-                if (attempt < 6) setTimeout(() => this.showPendingUpdateNotice(attempt + 1), 5000);
-                return;
-            }
-            const theme = this.getThemeStyles();
-
-            this.pendingUpdateNoticeOpen = true;
-            const clearNotice = () => {
-                this.pendingUpdateNoticeOpen = false;
-                fs.rmSync(this.pendingUpdatePath, { force: true });
-            };
-
-            BdApi.UI.showConfirmationModal(
-                "DiscordLyrics updated",
-                BdApi.React.createElement("div", {
-                    style: {
-                        display: "grid",
-                        gap: "10px",
-                        maxHeight: "280px",
-                        overflow: "auto",
-                        color: theme.text
-                    }
-                },
-                    BdApi.React.createElement("div", null, `Version ${notice.version} is installed.`),
-                    BdApi.React.createElement("strong", { style: { color: theme.heading } }, "What's new"),
-                    BdApi.React.createElement("div", { style: { display: "grid", gap: "8px" } }, this.renderReleaseNotes(notice.body || ""))
-                ),
-                {
-                    confirmText: "Nice",
-                    cancelText: "Close",
-                    onConfirm: clearNotice,
-                    onCancel: clearNotice
-                }
-            );
-        } catch (error) {
-            console.warn("[SpotifyLyricsStatus] Could not show update notice", error);
-        }
-    }
-
-    getThemeValue(name, fallback) {
-        try {
-            return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+            child?.kill();
         } catch {
-            return fallback;
+            void 0;
         }
     }
 
-    getThemeStyles() {
-        return {
-            surface: this.getThemeValue("--background-secondary", "#2b2d31"),
-            surfaceAlt: this.getThemeValue("--background-tertiary", "#1e1f22"),
-            border: this.getThemeValue("--background-modifier-accent", "rgba(255, 255, 255, 0.08)"),
-            text: this.getThemeValue("--text-normal", "#dbdee1"),
-            heading: this.getThemeValue("--header-primary", "#f2f3f5"),
-            muted: this.getThemeValue("--text-muted", "#949ba4"),
-            accent: this.getThemeValue("--brand-500", this.getThemeValue("--brand-experiment", "#5865f2")),
-            accentText: this.getThemeValue("--white-500", "#ffffff")
-        };
+    onWindowsMediaState(line) {
+        let state;
+        try {
+            state = JSON.parse(line);
+        } catch {
+            return;
+        }
+
+        const w = this.windows;
+        const now = Date.now();
+        w.restarts = 0;
+        w.receivedAt = now;
+        w.processRunning = Boolean(state?.processRunning);
+        if (w.processRunning) w.processSeenAt = now;
+        w.track = this.normalizeWindowsTrack(state?.track);
     }
 
-    getSettingsPanel() {
-        const theme = this.getThemeStyles();
-        const panel = document.createElement("div");
-        panel.style.display = "grid";
-        panel.style.gap = "8px";
-        panel.style.padding = "12px";
-        panel.style.background = theme.surface;
-        panel.style.border = `1px solid ${theme.border}`;
-        panel.style.borderRadius = "8px";
-        panel.style.color = theme.text;
+    normalizeWindowsTrack(media) {
+        const title = this.cleanText(media?.title);
+        if (!title) return null;
 
-        const button = document.createElement("button");
-        button.textContent = "Check for updates";
-        button.style.width = "fit-content";
-        button.style.padding = "8px 12px";
-        button.style.borderRadius = "6px";
-        button.style.border = "0";
-        button.style.cursor = "pointer";
-        button.style.background = theme.accent;
-        button.style.color = theme.accentText;
-        button.style.fontWeight = "600";
-
-        const current = document.createElement("div");
-        const latest = document.createElement("div");
-        const checked = document.createElement("div");
-        [current, latest, checked].forEach(item => {
-            item.style.fontSize = "12px";
-            item.style.color = theme.muted;
+        const artist = this.cleanText(media?.artist);
+        const fallback = this.findLastKnownTrack(title, artist);
+        return this.rememberTrack({
+            title,
+            artist,
+            album: this.cleanText(media?.album) || fallback?.album || "",
+            durationMs: this.normalizeDurationMs(media?.durationMs) || fallback?.durationMs || 0,
+            progressMs: Math.max(0, Number(media?.positionMs || 0)),
+            isPlaying: this.cleanText(media?.status).toLowerCase() === "playing"
         });
-
-        const render = () => {
-            current.textContent = `Current version: ${this.version}`;
-            latest.textContent = `Latest on GitHub: ${this.latestVersion || "not checked"}`;
-            checked.textContent = this.formatLastChecked(this.lastUpdateCheckedAt);
-        };
-
-        button.addEventListener("click", async () => {
-            button.disabled = true;
-            button.textContent = "Checking...";
-            await this.checkForUpdates();
-            button.disabled = false;
-            button.textContent = "Check for updates";
-            render();
-        });
-
-        render();
-        panel.append(button, current, latest, checked);
-        return panel;
     }
 
-    async loadLyrics(track) {
-        if (this.fetchController) this.fetchController.abort();
-        this.fetchController = new AbortController();
+    // ---- Lyrics ----
 
-        const params = new URLSearchParams({
-            track_name: track.title,
-            artist_name: track.artist
-        });
+    async loadLyrics(track, trackKey) {
+        this.fetchController?.abort();
+        this.fetchController = null;
 
+        const cached = this.lyricsCache.get(trackKey);
+        if (cached) {
+            this.lyricsCache.delete(trackKey);
+            this.lyricsCache.set(trackKey, cached);
+            this.lyrics = cached;
+            return;
+        }
+
+        const controller = new AbortController();
+        this.fetchController = controller;
+        const timeout = setTimeout(() => controller.abort(), CONFIG.lyricsFetchTimeoutMs);
+
+        try {
+            const lyrics = await this.fetchLyrics(track, controller.signal);
+            this.lyricsCache.set(trackKey, lyrics);
+            if (this.lyricsCache.size > CONFIG.lyricsCacheSize) {
+                this.lyricsCache.delete(this.lyricsCache.keys().next().value);
+            }
+            if (this.lastTrackKey === trackKey) this.lyrics = lyrics;
+        } catch (error) {
+            if (error?.name !== "AbortError") console.warn("[DiscordLyrics] Could not load synced lyrics", error);
+        } finally {
+            clearTimeout(timeout);
+            if (this.fetchController === controller) this.fetchController = null;
+        }
+    }
+
+    async fetchLyrics(track, signal) {
+        const params = new URLSearchParams({ track_name: track.title, artist_name: track.artist });
         if (track.album) params.set("album_name", track.album);
         if (track.durationMs) params.set("duration", String(Math.round(track.durationMs / 1000)));
 
-        try {
-            const response = await fetch(`https://lrclib.net/api/get?${params}`, {
-                signal: this.fetchController.signal,
-                headers: {
-                    "Accept": "application/json"
-                }
-            });
+        const exact = await this.fetchLrclib(`https://lrclib.net/api/get?${params}`, signal);
+        const exactLyrics = this.parseSyncedLyrics(exact?.syncedLyrics || "");
+        if (exactLyrics.length) return exactLyrics;
 
-            if (!response.ok) throw new Error(`LRCLIB returned ${response.status}`);
+        // No exact match: fall back to LRCLIB search with progressively looser queries.
+        const title = this.stripFeatureText(track.title);
+        const queries = [...new Set([
+            `${track.title} ${track.artist}`,
+            `${title} ${this.firstArtist(track.artist)}`,
+            `${title} ${track.artist}`
+        ])];
 
-            const data = await response.json();
-            this.lyricsSource = data;
-            this.lyrics = this.parseSyncedLyrics(data.syncedLyrics || data.synced_lyrics || "");
-        } catch (error) {
-            if (error.name !== "AbortError") {
-                console.warn("[SpotifyLyricsStatus] Could not load synced lyrics", error);
-                this.lyrics = [];
-            }
+        for (const q of queries) {
+            const results = await this.fetchLrclib(`https://lrclib.net/api/search?${new URLSearchParams({ q })}`, signal);
+            if (!Array.isArray(results)) continue;
+
+            const best = results
+                .filter(result => result?.syncedLyrics)
+                .map(result => ({ result, score: this.scoreLyricsResult(result, track) }))
+                .sort((a, b) => b.score - a.score)[0];
+
+            // Needs a title match plus artist/duration evidence, so another song by the same artist isn't picked.
+            if (best && best.score >= 8) return this.parseSyncedLyrics(best.result.syncedLyrics);
         }
+
+        return [];
+    }
+
+    async fetchLrclib(url, signal) {
+        const response = await fetch(url, { signal, headers: { Accept: "application/json" } });
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`LRCLIB returned ${response.status}`);
+        return response.json();
+    }
+
+    scoreLyricsResult(result, track) {
+        let score = 0;
+        const title = this.comparable(this.stripFeatureText(track.title));
+        const resultTitle = this.comparable(this.stripFeatureText(result.trackName));
+        const artist = this.comparable(this.firstArtist(track.artist));
+        const resultArtist = this.comparable(result.artistName);
+
+        if (title && resultTitle === title) score += 8;
+        else if (title && resultTitle && (resultTitle.includes(title) || title.includes(resultTitle))) score += 4;
+        else return 0;
+
+        if (artist && resultArtist.includes(artist)) score += 4;
+        if (track.album && this.comparable(result.albumName) === this.comparable(track.album)) score += 2;
+
+        if (track.durationMs && result.duration) {
+            const diff = Math.abs(result.duration - Math.round(track.durationMs / 1000));
+            if (diff <= 2) score += 4;
+            else if (diff <= 8) score += 2;
+        }
+
+        return score;
     }
 
     parseSyncedLyrics(raw) {
-        return raw
-            .split(/\r?\n/)
-            .map(line => {
-                const match = line.match(/^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.*)$/);
-                if (!match) return null;
+        const lines = [];
 
-                const minutes = Number(match[1]);
-                const seconds = Number(match[2]);
-                const fraction = match[3] || "0";
-                const millis = Number(fraction.padEnd(3, "0").slice(0, 3));
-                const text = this.cleanLyric(match[4]);
+        for (const line of String(raw || "").split(/\r?\n/)) {
+            // A line can carry several leading timestamps: [00:12.00][01:30.50] text
+            const match = /^((?:\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]\s*)+)(.*)$/.exec(line.trim());
+            if (!match) continue;
 
-                return { timeMs: minutes * 60000 + seconds * 1000 + millis, text };
-            })
-            .filter(line => line && line.text)
-            .sort((a, b) => a.timeMs - b.timeMs);
+            const text = this.cleanLyric(match[2]);
+            for (const stamp of match[1].matchAll(/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g)) {
+                const millis = Number((stamp[3] || "0").padEnd(3, "0").slice(0, 3));
+                lines.push({ timeMs: Number(stamp[1]) * 60000 + Number(stamp[2]) * 1000 + millis, text });
+            }
+        }
+
+        return lines.sort((a, b) => a.timeMs - b.timeMs);
     }
 
     getCurrentLyric(progressMs) {
-        if (!this.lyrics.length) return "";
-
         let low = 0;
         let high = this.lyrics.length - 1;
         let current = -1;
 
         while (low <= high) {
-            const mid = Math.floor((low + high) / 2);
+            const mid = (low + high) >> 1;
             if (this.lyrics[mid].timeMs <= progressMs) {
                 current = mid;
                 low = mid + 1;
@@ -716,56 +581,135 @@ try {
         return current >= 0 ? this.lyrics[current].text : "";
     }
 
+    // ---- Custom status ----
+
     getCurrentCustomStatusText() {
-        try {
-            const localPresence = this.PresenceStore?.getLocalPresence?.()
-                || this.PresenceStore?.getState?.()?.localPresence;
-            return this.cleanText(localPresence?.customStatus?.text || localPresence?.custom_status?.text);
-        } catch {
-            return "";
+        const presence = this.getLocalPresence();
+        if (!presence) return null;
+
+        const custom = presence.activities?.find(activity => activity?.type === 4);
+        if (custom) return this.cleanText(custom.state);
+        if (presence.customStatus || presence.custom_status) {
+            return this.cleanText(presence.customStatus?.text || presence.custom_status?.text);
         }
+        return Array.isArray(presence.activities) ? "" : null;
     }
 
     async setCustomStatus(text, force = false) {
         const status = this.trimStatus(text);
         const now = Date.now();
-        const actualStatus = this.getCurrentCustomStatusText();
-        const cacheMismatch = status && status === this.lastStatus && actualStatus !== status;
-        const canForce = force;
 
-        if (!cacheMismatch && !canForce && (status === this.lastStatus || now < this.statusCooldownUntil)) return;
+        if (!force) {
+            if (this.statusInFlight) return;
 
-        this.statusCooldownUntil = now + this.config.statusMinMs;
-        this.lastStatus = status;
-        if (force || cacheMismatch) this.lastForcedStatusAt = now;
+            if (status === this.lastStatus) {
+                // Same status as last time: only re-send if Discord shows something else, and at most every 30 s.
+                if (now - this.lastStatusSentAt < CONFIG.statusResyncMs) return;
+                const actual = this.getCurrentCustomStatusText();
+                if (actual === null || actual === status) {
+                    this.lastStatusSentAt = now;
+                    return;
+                }
+            }
 
-        const customStatus = status ? {
-            text: status,
-            expires_at: null
-        } : null;
-        this.lastStatusExpiresAt = 0;
-        this.lastRemoteStatus = status;
-
-        const body = { custom_status: customStatus };
-
-        if (this.HTTP?.patch) {
-            await this.HTTP.patch({
-                url: "/users/@me/settings",
-                body
-            });
-            return;
+            if (now < this.statusCooldownUntil) return;
         }
 
-        throw new Error("Could not find Discord HTTP module.");
+        if (!this.HTTP?.patch) throw new Error("Could not find Discord HTTP module.");
+
+        this.statusInFlight = true;
+        this.lastStatus = status;
+        this.lastStatusSentAt = now;
+        this.statusCooldownUntil = now + CONFIG.statusMinIntervalMs;
+
+        try {
+            await this.HTTP.patch({
+                url: "/users/@me/settings",
+                body: { custom_status: status ? { text: status, expires_at: null } : null }
+            });
+        } catch (error) {
+            const retryAfter = Number(error?.body?.retry_after ?? error?.retryAfter);
+            this.statusCooldownUntil = Date.now() + (retryAfter > 0 ? Math.ceil(retryAfter * 1000) : CONFIG.statusErrorBackoffMs);
+            this.lastStatus = null; // retry on a later tick
+            console.warn("[DiscordLyrics] Discord rejected the status update", error);
+        } finally {
+            this.statusInFlight = false;
+        }
     }
 
+    // ---- Settings ----
+
+    getSettingsPanel() {
+        const panel = document.createElement("div");
+        Object.assign(panel.style, {
+            display: "grid",
+            gap: "12px",
+            padding: "12px",
+            color: "var(--text-normal)"
+        });
+
+        const field = (label, key, type, hint) => {
+            const row = document.createElement("label");
+            Object.assign(row.style, { display: "grid", gap: "4px", fontSize: "14px" });
+
+            const input = document.createElement("input");
+            input.type = type;
+            if (type === "checkbox") {
+                input.checked = Boolean(this.settings[key]);
+                Object.assign(row.style, { display: "flex", alignItems: "center", gap: "8px" });
+            } else {
+                input.value = String(this.settings[key]);
+                Object.assign(input.style, {
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--background-modifier-accent)",
+                    background: "var(--input-background, var(--background-tertiary))",
+                    color: "var(--text-normal)"
+                });
+            }
+
+            input.addEventListener("change", () => {
+                if (type === "checkbox") this.settings[key] = input.checked;
+                else if (type === "number") this.settings[key] = Number(input.value) || 0;
+                else this.settings[key] = input.value;
+                this.saveSettings();
+                if (key === "windowsMediaFallback" && !input.checked) this.stopWindowsWatcher();
+                this.lastStatus = null;
+            });
+
+            const caption = document.createElement("span");
+            caption.textContent = label;
+            if (type === "checkbox") row.append(input, caption);
+            else row.append(caption, input);
+
+            if (hint) {
+                const note = document.createElement("span");
+                note.textContent = hint;
+                Object.assign(note.style, { fontSize: "12px", color: "var(--text-muted)" });
+                row.append(note);
+            }
+            return row;
+        };
+
+        const version = document.createElement("div");
+        version.textContent = `Version ${this.version}`;
+        Object.assign(version.style, { fontSize: "12px", color: "var(--text-muted)" });
+
+        panel.append(
+            field("Pause prefix", "pausedPrefix", "text"),
+            field("No-lyrics prefix", "noLyricsPrefix", "text"),
+            field("Lyric offset (ms)", "lyricOffsetMs", "number", "Positive shows lines earlier, negative later."),
+            field("Use Windows media info when Discord has no Spotify data", "windowsMediaFallback", "checkbox"),
+            version
+        );
+        return panel;
+    }
+
+    // ---- Helpers ----
+
     getTrackKey(track) {
-        return [
-            track.syncId,
-            track.title.toLowerCase(),
-            track.artist.toLowerCase(),
-            Math.round((track.durationMs || 0) / 1000)
-        ].join("|");
+        // Source-independent, so switching between Discord and Windows data doesn't refetch lyrics.
+        return `${this.comparable(track.title)}|${this.comparable(this.firstArtist(track.artist))}`;
     }
 
     normalizeDurationMs(duration) {
@@ -774,125 +718,40 @@ try {
         return value < 10000 ? Math.round(value * 1000) : Math.round(value);
     }
 
-    normalizeVersion(value) {
-        const match = String(value || "").match(/\d+\.\d+\.\d+/);
-        return match ? match[0] : "";
-    }
-
-    compareVersions(a, b) {
-        const left = String(a || "").split(".").map(Number);
-        const right = String(b || "").split(".").map(Number);
-
-        for (let index = 0; index < 3; index++) {
-            if ((left[index] || 0) > (right[index] || 0)) return 1;
-            if ((left[index] || 0) < (right[index] || 0)) return -1;
-        }
-
-        return 0;
-    }
-
-    releaseBodyPreview(body) {
-        const value = typeof body === "object" && body && "value" in body ? body.value : body;
-        const text = String(value || "No release notes were provided.")
-            .replace(/\r\n/g, "\n")
-            .replace(/[ \t]+\n/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim();
-        return text.length > 1200 ? `${text.slice(0, 1200)}...` : text;
-    }
-
-    renderReleaseNotes(body) {
-        const React = BdApi.React;
-        const text = this.releaseBodyPreview(body);
-        const theme = this.getThemeStyles();
-        const blocks = [];
-        let listItems = [];
-
-        const flushList = () => {
-            if (!listItems.length) return;
-            const items = listItems;
-            listItems = [];
-            blocks.push(React.createElement("ul", {
-                key: `list-${blocks.length}`,
-                style: { margin: "0 0 0 18px", padding: 0, color: theme.text }
-            }, items.map((item, index) => React.createElement("li", {
-                key: index,
-                style: { marginBottom: "4px" }
-            }, item))));
-        };
-
-        for (const rawLine of text.split(/\r?\n/)) {
-            const line = rawLine.trim();
-            if (!line) {
-                flushList();
-                continue;
-            }
-
-            const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-            if (heading) {
-                flushList();
-                const level = heading[1].length;
-                blocks.push(React.createElement("div", {
-                    key: `heading-${blocks.length}`,
-                    style: {
-                        color: theme.heading,
-                        fontWeight: 700,
-                        fontSize: level <= 2 ? "16px" : "14px",
-                        marginTop: blocks.length ? "6px" : 0
-                    }
-                }, heading[2]));
-                continue;
-            }
-
-            const bullet = /^[-*]\s+(.+)$/.exec(line);
-            if (bullet) {
-                listItems.push(bullet[1]);
-                continue;
-            }
-
-            flushList();
-            blocks.push(React.createElement("p", {
-                key: `paragraph-${blocks.length}`,
-                style: { margin: 0, color: theme.muted, lineHeight: 1.45 }
-            }, line));
-        }
-
-        flushList();
-        return blocks.length ? blocks : React.createElement("p", { style: { margin: 0, color: theme.muted } }, "No release notes were provided.");
-    }
-
-    formatLastChecked(value) {
-        const timestamp = Number(value || 0);
-        if (!Number.isFinite(timestamp) || timestamp <= 0) return "Last checked: never";
-        return `Last checked: ${new Date(timestamp).toLocaleString()}`;
-    }
-
     comparable(value) {
-        return this.cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        return this.cleanText(value).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
     }
 
     firstArtist(value) {
-        return this.cleanText(value).split(",")[0] || "";
+        return this.cleanText(value).split(/,|&| x | feat\.?| ft\.?/i)[0]?.trim() || "";
+    }
+
+    stripFeatureText(value) {
+        // "with" only inside brackets, so titles like "Song - With You" keep their words.
+        return this.cleanText(value)
+            .replace(/\s*[([]\s*(feat\.?|ft\.?|with)\s+[^)\]]*[)\]]/ig, "")
+            .replace(/\s*-\s*(feat\.?|ft\.?)\s.*$/i, "")
+            .replace(/\s*\([^)]*(remaster|sped up|slowed|nightcore|version)[^)]*\)/ig, "")
+            .replace(/\s*-\s*[^-]*(remaster|sped up|slowed|nightcore)[^-]*$/i, "")
+            .trim();
     }
 
     cleanLyric(value) {
         const text = this.cleanText(value)
             .replace(/\s*\[[^\]]+\]\s*/g, " ")
-            .replace(/\s*\([^)]+instrumental[^)]*\)\s*/ig, " ");
+            .replace(/\s*\([^)]*instrumental[^)]*\)\s*/ig, " ")
+            .trim();
 
-        return text || "\u266a";
+        return text || "♪";
     }
 
     cleanText(value) {
-        return String(value || "")
-            .replace(/\s+/g, " ")
-            .trim();
+        return String(value || "").replace(/\s+/g, " ").trim();
     }
 
     trimStatus(value) {
-        const text = this.cleanText(value);
-        if (text.length <= this.config.maxStatusLength) return text;
-        return `${text.slice(0, this.config.maxStatusLength - 1).trim()}...`;
+        const chars = [...this.cleanText(value)];
+        if (chars.length <= CONFIG.maxStatusLength) return chars.join("");
+        return `${chars.slice(0, CONFIG.maxStatusLength - 3).join("").trim()}...`;
     }
 };
-
