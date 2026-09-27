@@ -47,6 +47,38 @@ export async function fetchJson(_: IpcMainInvokeEvent, url: string) {
     }
 }
 
+// https://developers.spicylyrics.org/docs/reference/get.lyrics — the secret key only ever goes to api.spicylyrics.org.
+export async function fetchSpicyLyrics(_: IpcMainInvokeEvent, trackId: string, key: string) {
+    if (!/^[A-Za-z0-9]{22}$/.test(String(trackId))) return { status: 400, data: null };
+    if (!/^sl_sk_\S+$/.test(String(key))) return { status: 401, data: null };
+
+    try {
+        const response = await fetchWithTimeout(`https://api.spicylyrics.org/v1/lyrics/${trackId}`, {
+            headers: {
+                Accept: "application/json",
+                Authorization: `Bearer ${key}`,
+                "User-Agent": "DiscordLyrics (https://github.com/sh1guchi/DiscordLyrics)"
+            }
+        });
+
+        const text = await response.text();
+        let data: unknown = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch {
+            data = null;
+        }
+
+        return {
+            status: response.status,
+            data,
+            retryAfter: Number(response.headers.get("retry-after")) || undefined
+        };
+    } catch {
+        return { status: -1, data: null };
+    }
+}
+
 function cleanQueryPart(value: string) {
     return String(value || "").replace(/\s+/g, " ").trim();
 }

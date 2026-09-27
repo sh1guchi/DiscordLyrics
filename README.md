@@ -1,6 +1,7 @@
 # DiscordLyrics
 
-Плагин ставит в статус Discord текущую строчку песни из Spotify (тексты с LRCLIB).
+Плагин ставит в статус Discord текущую строчку песни из Spotify (тексты с LRCLIB, в Vencord-версии
+по желанию ещё и из [Spicy Lyrics](#25-spicy-lyrics-необязательно-только-vencordequicord)).
 Это форк [MallyDev2/DiscordLyrics](https://github.com/MallyDev2/DiscordLyrics) 1.0.6 с исправлениями
 и оптимизациями — полный список в [CHANGES.md](CHANGES.md).
 
@@ -95,7 +96,29 @@ pnpm inject
 Он сам включит нужный ему `SpotifyControls`. После включения перезапусти Discord полностью.
 
 В настройках плагина: стиль шрифта, тексты для загрузки/паузы/«нет текста», Rich Presence,
-чтение Spotify через Windows и отладочный лог.
+чтение Spotify через Windows, ключ Spicy Lyrics и отладочный лог.
+
+### 2.5. Spicy Lyrics (необязательно, только Vencord/Equicord)
+
+[Spicy Lyrics](https://developers.spicylyrics.org) даёт тексты из своей базы (синхронизации от сообщества),
+Apple Music и Spotify, часто с синхронизацией по словам: длинные строки тогда листаются ровно в момент,
+когда поётся следующий кусок.
+
+1. Зайди на <https://developers.spicylyrics.org>, создай приложение (Project URL — ссылка на свой форк
+   или этот репозиторий) и сохрани ключ `sl_sk_...`. Ключ показывают один раз.
+2. Discord → Настройки → Vencord → Plugins → DiscordLyrics → вставь ключ в **spicyLyricsKey**.
+
+Как это работает:
+- Сначала запрос в Spicy Lyrics, если его нет — LRCLIB, как раньше. Без ключа всё как раньше.
+- Нужен Spotify, привязанный к Discord (нужен ID трека). В режиме «через Windows» используется только LRCLIB.
+- **Нужен включённый Rich Presence.** Правила Spicy требуют указывать источник рядом с текстом, поэтому
+  в заголовке карточки пишется «lyrics: Spicy Lyrics / Apple Music / Spotify», а для синхронизаций от
+  сообщества — кнопки со ссылками на автора. Свои кнопки Discord тебе не показывает, другие их видят.
+  Если Rich Presence выключен, плагин Spicy не использует.
+- Если ключ неверный — одно уведомление и дальше LRCLIB; при превышении лимита Spicy на время
+  пропускается. Ключ уходит только на `api.spicylyrics.org` и не пишется в лог.
+- Ключ хранится в настройках Vencord на твоём ПК. Не выкладывай свой `settings.json` и не делись ключом —
+  по правилам Spicy у каждого должен быть свой.
 
 ---
 

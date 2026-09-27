@@ -33,7 +33,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.2";
+const RELEASE_VERSION = "1.0.6-personal.3";
 
 type FontStyleId =
     | "normal"
@@ -148,6 +148,40 @@ interface NormalizedTrack {
 interface LyricLine {
     timeMs: number;
     text: string;
+    // Start time of every word in text.split(" ") order, when the source has word-level sync.
+    wordTimesMs?: number[];
+}
+
+// Who to credit for the lyrics on screen (Spicy Lyrics API terms, section 6).
+interface LyricsAttribution {
+    provider: string;
+    uploader?: { username: string; url?: string; };
+    maker?: { username: string; url?: string; };
+}
+
+interface LoadedLyrics {
+    lines: LyricLine[];
+    attribution?: LyricsAttribution;
+}
+
+interface SpicyPerson {
+    username?: string;
+    url?: string;
+}
+
+interface SpicyBody {
+    Type?: string;
+    source?: string;
+    Content?: Array<{
+        Text?: string;
+        StartTime?: number;
+        Lead?: {
+            StartTime?: number;
+            Syllables?: Array<{ Text?: string; StartTime?: number; IsPartOfWord?: boolean; }>;
+        };
+    }>;
+    Lines?: Array<{ Text?: string; }>;
+    UploadAttribution?: { Uploader?: SpicyPerson; Maker?: SpicyPerson; };
 }
 
 interface ActiveLyricLine extends LyricLine {
@@ -192,6 +226,9 @@ const fallbackAlbumImageCache = new Map<string, string | undefined>();
 const fallbackAlbumImageRequests = new Map<string, Promise<string | undefined>>();
 let fetchController: AbortController | undefined;
 let lyrics: LyricLine[] = [];
+let lyricsAttribution: LyricsAttribution | undefined;
+let spicyMutedUntil = 0;
+let spicyRejectedKey = "";
 let lastTrackKey = "";
 let loadingTrackKey = "";
 let lastStatusText = "";
@@ -226,7 +263,7 @@ const CACHE_LIMIT = 200;
 const LYRICS_CACHE_LIMIT = 50;
 const albumAssetCache = new Map<string, Promise<string | undefined>>();
 const albumAssetResolved = new Map<string, string | undefined>();
-const lyricsCache = new Map<string, LyricLine[]>();
+const lyricsCache = new Map<string, LoadedLyrics>();
 const statusSettingCache = new Map<string, ReturnType<typeof findStatusSetting>>();
 const pluginAuthor = { name: "mally", id: 0n };
 
@@ -333,6 +370,16 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Use unsynced lyrics if synced lyrics are missing. This is less accurate.",
         default: DEFAULT_SETTINGS.usePlainLyricsFallback
+    },
+    // Deliberately not in DEFAULT_SETTINGS, so "Reset defaults" keeps the key.
+    spicyLyricsKey: {
+        type: OptionType.STRING,
+        description: "Spicy Lyrics API secret key (sl_sk_...) from developers.spicylyrics.org. Used first, LRCLIB stays as fallback. Needs Rich Presence on (the source is credited there) and Spotify linked to Discord. Empty = LRCLIB only.",
+        default: "",
+        onChange: () => {
+            spicyRejectedKey = "";
+            spicyMutedUntil = 0;
+        }
     },
     enableRpc: {
         type: OptionType.BOOLEAN,
@@ -805,7 +852,8 @@ function updateRpc(track: NormalizedTrack, paused = false) {
     const progress = Math.max(0, duration ? Math.min(track.progressMs, duration) : track.progressMs);
     const now = Date.now();
     const startedAt = paused || !duration ? 0 : now - progress;
-    const key = `${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}`;
+    const credit = getLyricsCredit();
+    const key = `${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.key ?? ""}`;
     const timingDrift = startedAt && lastRpcStartedAt ? Math.abs(startedAt - lastRpcStartedAt) : 0;
     if (key === lastRpcKey && (!startedAt || timingDrift < 5000)) return;
     lastRpcKey = key;
@@ -816,7 +864,11 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         : settings.store.rpcName || DEFAULT_SETTINGS.rpcName;
     const activity: Activity = {
         application_id: "0",
-        name: rpcName,
+        name: credit ? `${rpcName} · lyrics: ${credit.provider}` : rpcName,
+        ...(credit?.buttons.length ? {
+            buttons: credit.buttons.map(button => button.label),
+            metadata: { button_urls: credit.buttons.map(button => button.url) }
+        } : {}),
         details: paused ? `${settings.store.pausedPrefix}${rpcTrack.title}` : rpcTrack.title,
         state: getTrackSubtitle(rpcTrack),
         type: ActivityType.LISTENING,
@@ -838,6 +890,32 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         socketId: RPC_SOCKET_ID,
     });
     debugLog(`rpc update ${paused ? "paused" : "playing"} "${track.title}" progress=${Math.round(progress)}ms duration=${duration}ms start=${startedAt || ""} image=${largeImage ?? ""}`);
+}
+
+// Credit for the lyrics in the status, shown on the Rich Presence card (Spicy Lyrics terms: always name the provider;
+// for community syncs also link the uploader and the maker). The header is visible to everyone including you; Discord
+// hides your own activity buttons from you, but everyone else sees them.
+function getLyricsCredit() {
+    const attribution = lyricsAttribution;
+    if (!attribution) return undefined;
+
+    const fitLabel = (text: string) => [...text].length <= 32 ? text : `${[...text].slice(0, 31).join("")}…`;
+    const people = [
+        attribution.uploader && { role: "Uploaded by", ...attribution.uploader },
+        attribution.maker && { role: "Synced by", ...attribution.maker }
+    ].filter(Boolean) as Array<{ role: string; username: string; url?: string; }>;
+    const unique = people.filter((person, index) => people.findIndex(other => other.username === person.username) === index);
+    const buttons = unique.map(person => ({
+        // Same person uploaded and synced: one button covers both.
+        label: fitLabel(unique.length < people.length ? `Synced by @${person.username}` : `${person.role} @${person.username}`),
+        url: person.url ?? "https://spicylyrics.org"
+    }));
+
+    return {
+        provider: attribution.provider,
+        buttons,
+        key: `${attribution.provider}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`
+    };
 }
 
 function getTrackSubtitle(track: NormalizedTrack) {
@@ -1194,7 +1272,7 @@ function prepareTrack(track: NormalizedTrack) {
 
     debugLog(`track change "${track.title}"`);
     lastTrackKey = key;
-    lyrics = [];
+    applyLoadedLyrics({ lines: [] });
     clearProfileStatusForTrackChange();
 
     if (supportsSyncedLyrics(track)) {
@@ -1305,9 +1383,141 @@ async function searchLyrics(track: NormalizedTrack): Promise<LrcLibResult | null
     return null;
 }
 
+// ---- Spicy Lyrics (https://developers.spicylyrics.org) ----
+
+const SPICY_PROVIDERS: Record<string, string> = {
+    spicy_lyrics: "Spicy Lyrics",
+    apple_music: "Apple Music",
+    spotify: "Spotify"
+};
+
+function getSpicyKey() {
+    const key = cleanText(settings.store.spicyLyricsKey);
+    return /^sl_sk_\S+$/.test(key) ? key : "";
+}
+
+// Spicy's terms require crediting the source next to the lyrics; this plugin does that on the Rich Presence card,
+// so without the card Spicy isn't used at all.
+function canUseSpicy(track: NormalizedTrack) {
+    const key = getSpicyKey();
+    return Boolean(key)
+        && key !== spicyRejectedKey
+        && settings.store.enableRpc
+        && /^[A-Za-z0-9]{22}$/.test(track.id)
+        && Date.now() >= spicyMutedUntil;
+}
+
+function spicyPerson(person: SpicyPerson | undefined) {
+    const username = cleanText(person?.username);
+    if (!username) return undefined;
+    const url = cleanText(person?.url);
+    return { username, url: /^https:\/\//.test(url) ? url : undefined };
+}
+
+function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean; } {
+    if (body.Type === "Syllable") {
+        const lines: LyricLine[] = [];
+        for (const entry of body.Content ?? []) {
+            // IsPartOfWord = this syllable joins the next one without a space.
+            const words: Array<{ text: string; startMs: number; }> = [];
+            let current: { text: string; startMs: number; } | undefined;
+            for (const syllable of entry.Lead?.Syllables ?? []) {
+                current ??= { text: "", startMs: Number(syllable.StartTime ?? 0) * 1000 };
+                current.text += String(syllable.Text ?? "");
+                if (!syllable.IsPartOfWord) {
+                    words.push(current);
+                    current = undefined;
+                }
+            }
+            if (current) words.push(current);
+
+            const flat = words.flatMap(word => cleanText(word.text).split(" ").filter(Boolean).map(text => ({ text, startMs: word.startMs })));
+            if (!flat.length) continue;
+            lines.push({
+                timeMs: Number(entry.Lead?.StartTime ?? flat[0].startMs / 1000) * 1000,
+                text: flat.map(word => word.text).join(" "),
+                wordTimesMs: flat.map(word => word.startMs)
+            });
+        }
+        return { lines: lines.sort((a, b) => a.timeMs - b.timeMs), synced: true };
+    }
+
+    if (body.Type === "Line") {
+        const lines = (body.Content ?? [])
+            .map(entry => ({ timeMs: Number(entry.StartTime ?? 0) * 1000, text: cleanText(entry.Text) }))
+            .filter(line => line.text)
+            .sort((a, b) => a.timeMs - b.timeMs);
+        return { lines, synced: true };
+    }
+
+    // "Static": text without timings.
+    const lines = (body.Lines ?? []).map(line => ({ timeMs: 0, text: cleanText(line.Text) })).filter(line => line.text);
+    return { lines, synced: false };
+}
+
+async function fetchSpicyLyrics(track: NormalizedTrack): Promise<LoadedLyrics | null> {
+    const fetchNative = Native?.fetchSpicyLyrics as ((trackId: string, key: string) => Promise<{ status: number; data: { Body?: SpicyBody; } | null; retryAfter?: number; }>) | undefined;
+    if (!fetchNative) return null;
+
+    const key = getSpicyKey();
+    const response = await fetchNative(track.id, key);
+
+    if (response.status === 401 || response.status === 403) {
+        spicyRejectedKey = key;
+        showToast("DiscordLyrics: Spicy Lyrics rejected the API key, using LRCLIB", Toasts.Type.FAILURE);
+        return null;
+    }
+    if (response.status === 429 || response.status >= 500 || response.status < 0) {
+        const retryAfterMs = Number(response.retryAfter) > 0 ? Number(response.retryAfter) * 1000 : 0;
+        spicyMutedUntil = Date.now() + Math.max(retryAfterMs, response.status === 429 ? 60000 : 30000);
+        debugLog(`spicy lyrics unavailable status=${response.status}, muted for ${Math.round((spicyMutedUntil - Date.now()) / 1000)}s`);
+        return null;
+    }
+    const body = response.data?.Body;
+    if (response.status !== 200 || !body) return null;
+
+    const attribution: LyricsAttribution = {
+        provider: SPICY_PROVIDERS[cleanText(body.source)] ?? "unknown source",
+        ...(body.source === "spicy_lyrics" ? {
+            uploader: spicyPerson(body.UploadAttribution?.Uploader),
+            maker: spicyPerson(body.UploadAttribution?.Maker)
+        } : {})
+    };
+    // Unsynced ("Static") answers fall through to LRCLIB, which has its own plain-lyrics fallback.
+    const { lines, synced } = parseSpicyLines(body);
+    if (!lines.length || !synced) return null;
+    return { lines, attribution };
+}
+
+async function fetchLrclibLyrics(track: NormalizedTrack): Promise<LoadedLyrics> {
+    const params = new URLSearchParams({
+        track_name: track.title,
+        artist_name: track.artist
+    });
+
+    if (track.album) params.set("album_name", track.album);
+    if (track.durationMs) params.set("duration", String(Math.round(track.durationMs / 1000)));
+
+    const exact = await fetchLyrics(`https://lrclib.net/api/get?${params}`);
+    const exactSynced = parseSyncedLyrics(exact?.syncedLyrics ?? exact?.synced_lyrics ?? "");
+    if (exactSynced.length) return { lines: exactSynced };
+
+    const found = await searchLyrics(track) ?? exact;
+    const synced = parseSyncedLyrics(found?.syncedLyrics ?? found?.synced_lyrics ?? "");
+    if (synced.length || !settings.store.usePlainLyricsFallback) return { lines: synced };
+
+    return { lines: parsePlainLyrics(found?.plainLyrics ?? "", track.durationMs) };
+}
+
 function lyricsCacheKey(track: NormalizedTrack) {
-    // Source-independent (Discord vs Windows data differ in id/duration) and aware of the plain-lyrics setting.
-    return `${cleanComparable(track.title)}|${cleanComparable(firstArtist(track.artist))}|${settings.store.usePlainLyricsFallback ? "plain" : "synced"}`;
+    // Source-independent (Discord vs Windows data differ in id/duration) and aware of the settings that change the result.
+    const spicy = canUseSpicy(track) ? `spicy:${track.id}` : "lrclib";
+    return `${cleanComparable(track.title)}|${cleanComparable(firstArtist(track.artist))}|${settings.store.usePlainLyricsFallback ? "plain" : "synced"}|${spicy}`;
+}
+
+function applyLoadedLyrics(loaded: LoadedLyrics) {
+    lyrics = loaded.lines;
+    lyricsAttribution = loaded.lines.length ? loaded.attribution : undefined;
 }
 
 async function loadLyrics(track: NormalizedTrack) {
@@ -1321,42 +1531,37 @@ async function loadLyrics(track: NormalizedTrack) {
         setBounded(lyricsCache, cacheKey, cached, LYRICS_CACHE_LIMIT);
         // Called synchronously from prepareTrack(); the caller's tick picks the lyrics up right away.
         if (loadingTrackKey === key && key === lastTrackKey) {
-            lyrics = cached;
+            applyLoadedLyrics(cached);
             loadingTrackKey = "";
         }
         return;
     }
 
-    const params = new URLSearchParams({
-        track_name: track.title,
-        artist_name: track.artist
-    });
-
-    if (track.album) params.set("album_name", track.album);
-    if (track.durationMs) params.set("duration", String(Math.round(track.durationMs / 1000)));
-
     try {
-        const exact = await fetchLyrics(`https://lrclib.net/api/get?${params}`);
-        const exactSynced = parseSyncedLyrics(exact?.syncedLyrics ?? exact?.synced_lyrics ?? "");
-        const found = exactSynced.length ? exact : await searchLyrics(track) ?? exact;
-        const synced = exactSynced.length
-            ? exactSynced
-            : parseSyncedLyrics(found?.syncedLyrics ?? found?.synced_lyrics ?? "");
-        const nextLyrics = synced.length || !settings.store.usePlainLyricsFallback
-            ? synced
-            : parsePlainLyrics(found?.plainLyrics ?? "", track.durationMs);
+        let loaded: LoadedLyrics | null = null;
 
-        setBounded(lyricsCache, cacheKey, nextLyrics, LYRICS_CACHE_LIMIT);
+        if (canUseSpicy(track)) {
+            try {
+                loaded = await fetchSpicyLyrics(track);
+            } catch (error) {
+                debugLog(`spicy lyrics failed ${stringifyError(error)}`);
+            }
+        }
+
+        loaded ??= await fetchLrclibLyrics(track);
+
+        // Session-only memory cache, well inside Spicy's 30-day storage limit.
+        setBounded(lyricsCache, cacheKey, loaded, LYRICS_CACHE_LIMIT);
         if (loadingTrackKey !== key || key !== lastTrackKey) return;
 
-        lyrics = nextLyrics;
+        applyLoadedLyrics(loaded);
         loadingTrackKey = "";
         tick();
     } catch (error) {
         if ((error as Error).name === "AbortError") return;
         console.warn("[SpotifyLyricsStatus] Could not load lyrics", error);
         if (loadingTrackKey === key && key === lastTrackKey) {
-            lyrics = [];
+            applyLoadedLyrics({ lines: [] });
             loadingTrackKey = "";
             tick();
         }
@@ -1518,8 +1723,32 @@ function lyricPageForStatus(line: ActiveLyricLine, progressMs: number) {
     // simply progress - line start. (The original also subtracted the offset here, which cut the last 650 ms of
     // every line's page schedule; together with weight-based timing that pushed the last page into that cut.)
     const elapsedMs = Math.max(0, progressMs - line.timeMs);
-    const index = Math.min(chunks.length - 1, Math.floor(elapsedMs / (displayMs / chunks.length)));
+    const starts = pageStartTimes(line, chunks, displayMs);
+    let index = 0;
+    for (let page = 1; page < chunks.length; page++) {
+        if (elapsedMs >= starts[page]) index = page;
+    }
     return formatStatus(chunks[index], true, fitsBubble);
+}
+
+// When each page appears, relative to the line start. With word-level sync a page appears when its first word is
+// sung; otherwise pages share the time equally. Either way each page stays up at least MIN_PAGE_MS.
+function pageStartTimes(line: ActiveLyricLine, chunks: string[], displayMs: number) {
+    const count = chunks.length;
+    const wordsPerChunk = chunks.map(chunk => chunk.split(" ").length);
+    const words = line.wordTimesMs;
+    const wordSynced = Boolean(words) && wordsPerChunk.reduce((sum, n) => sum + n, 0) === words!.length;
+
+    const starts = [0];
+    let firstWord = 0;
+    for (let page = 1; page < count; page++) {
+        firstWord += wordsPerChunk[page - 1];
+        const wanted = wordSynced ? words![firstWord] - line.timeMs : page * displayMs / count;
+        const earliest = starts[page - 1] + MIN_PAGE_MS;
+        const latest = displayMs - (count - page) * MIN_PAGE_MS;
+        starts.push(Math.min(Math.max(wanted, earliest), latest));
+    }
+    return starts;
 }
 
 function lyricAt(progressMs: number): ActiveLyricLine | undefined {
@@ -1569,7 +1798,7 @@ function tick() {
         if (!windowsSpotifyProcessRunning && Date.now() - windowsSpotifyProcessSeenAt > WINDOWS_SPOTIFY_PROCESS_GRACE_MS) {
             lastTrackKey = "";
             loadingTrackKey = "";
-            lyrics = [];
+            applyLoadedLyrics({ lines: [] });
             lastKnownSpotifyTrack = undefined;
             lastKnownSpotifyTrackAt = 0;
         }
@@ -1694,7 +1923,7 @@ export default definePlugin({
         windowsSpotifyProcessRunning = false;
         lastKnownSpotifyTrack = undefined;
         lastKnownSpotifyTrackAt = 0;
-        lyrics = [];
+        applyLoadedLyrics({ lines: [] });
         lastTrackKey = "";
         loadingTrackKey = "";
         lastPlaybackPlaying = undefined;
