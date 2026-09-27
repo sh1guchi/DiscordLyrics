@@ -1,4 +1,4 @@
-# DiscordLyrics — личная версия
+# DiscordLyrics
 
 Плагин ставит в статус Discord текущую строчку песни из Spotify (тексты с LRCLIB).
 Это форк [MallyDev2/DiscordLyrics](https://github.com/MallyDev2/DiscordLyrics) 1.0.6 с исправлениями
