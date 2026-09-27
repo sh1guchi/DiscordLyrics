@@ -29,11 +29,12 @@ const DEFAULT_SETTINGS = {
     rpcName: "Spotify",
     rpcShowWhenPaused: true,
     rpcShowAlbumArt: true,
+    rpcShowPluginButton: false,
     windowsMediaFallback: true,
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.4";
+const RELEASE_VERSION = "1.0.6-personal.5";
 
 type FontStyleId =
     | "normal"
@@ -400,6 +401,11 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Show the song cover on Rich Presence.",
         default: DEFAULT_SETTINGS.rpcShowAlbumArt
+    },
+    rpcShowPluginButton: {
+        type: OptionType.BOOLEAN,
+        description: "Add a \"Using DiscordLyrics\" button linking to the plugin's GitHub. Discord allows 2 buttons and Spicy Lyrics credits come first, so it is skipped when both are taken. Others see it; Discord hides your own buttons from you.",
+        default: DEFAULT_SETTINGS.rpcShowPluginButton
     },
     windowsMediaFallback: {
         type: OptionType.BOOLEAN,
@@ -862,7 +868,8 @@ function updateRpc(track: NormalizedTrack, paused = false) {
     const now = Date.now();
     const startedAt = paused || !duration ? 0 : now - progress;
     const credit = getLyricsCredit();
-    const key = `${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.key ?? ""}`;
+    const buttons = getRpcButtons(credit?.buttons ?? []);
+    const key = `${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.provider ?? ""}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`;
     const timingDrift = startedAt && lastRpcStartedAt ? Math.abs(startedAt - lastRpcStartedAt) : 0;
     if (key === lastRpcKey && (!startedAt || timingDrift < 5000)) return;
     lastRpcKey = key;
@@ -874,9 +881,9 @@ function updateRpc(track: NormalizedTrack, paused = false) {
     const activity: Activity = {
         application_id: "0",
         name: credit ? `${rpcName} · lyrics: ${credit.provider}` : rpcName,
-        ...(credit?.buttons.length ? {
-            buttons: credit.buttons.map(button => button.label),
-            metadata: { button_urls: credit.buttons.map(button => button.url) }
+        ...(buttons.length ? {
+            buttons: buttons.map(button => button.label),
+            metadata: { button_urls: buttons.map(button => button.url) }
         } : {}),
         details: paused ? `${settings.store.pausedPrefix}${rpcTrack.title}` : rpcTrack.title,
         state: getTrackSubtitle(rpcTrack),
@@ -920,11 +927,19 @@ function getLyricsCredit() {
         url: person.url ?? "https://spicylyrics.org"
     }));
 
-    return {
-        provider: attribution.provider,
-        buttons,
-        key: `${attribution.provider}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`
-    };
+    return { provider: attribution.provider, buttons };
+}
+
+const PLUGIN_URL = "https://github.com/sh1guchi/DiscordLyrics";
+const MAX_ACTIVITY_BUTTONS = 2; // Discord's limit
+
+// Required lyrics credits first; the optional plugin link only takes a free slot.
+function getRpcButtons(creditButtons: Array<{ label: string; url: string; }>) {
+    const buttons = creditButtons.slice(0, MAX_ACTIVITY_BUTTONS);
+    if (settings.store.rpcShowPluginButton && buttons.length < MAX_ACTIVITY_BUTTONS) {
+        buttons.push({ label: "Using DiscordLyrics", url: PLUGIN_URL });
+    }
+    return buttons;
 }
 
 function getTrackSubtitle(track: NormalizedTrack) {
