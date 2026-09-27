@@ -33,7 +33,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.3";
+const RELEASE_VERSION = "1.0.6-personal.4";
 
 type FontStyleId =
     | "normal"
@@ -406,6 +406,11 @@ const settings = definePluginSettings({
         description: "Read Spotify from Windows media controls when Discord has no Spotify data (e.g. account not linked).",
         default: DEFAULT_SETTINGS.windowsMediaFallback
     },
+    lyricsProxy: {
+        type: OptionType.STRING,
+        description: "Proxy for lyrics requests. Empty = Windows system proxy, same as Discord (works with Clash, v2rayN etc. in system proxy mode). Or http://127.0.0.1:7890, socks5://127.0.0.1:1080, or \"direct\".",
+        default: ""
+    },
     debugLogging: {
         type: OptionType.BOOLEAN,
         description: "Write a debug log to %APPDATA%\\DiscordLyrics\\debug.log (capped at 1 MB).",
@@ -428,6 +433,10 @@ const settings = definePluginSettings({
 
 function cleanText(value: unknown) {
     return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function getLyricsProxy() {
+    return cleanText(settings.store.lyricsProxy);
 }
 
 function cleanDescription(value: unknown) {
@@ -935,8 +944,8 @@ async function lookupFallbackAlbumImage(track: NormalizedTrack) {
 
     const request = (async () => {
         try {
-            const searchAlbumImage = Native?.searchAlbumImage as ((title: string, artist: string, album: string) => Promise<string>) | undefined;
-            const url = searchAlbumImage ? cleanText(await searchAlbumImage(track.title, track.artist, track.album)) : undefined;
+            const searchAlbumImage = Native?.searchAlbumImage as ((title: string, artist: string, album: string, proxy: string) => Promise<string>) | undefined;
+            const url = searchAlbumImage ? cleanText(await searchAlbumImage(track.title, track.artist, track.album, getLyricsProxy())) : undefined;
             setBounded(fallbackAlbumImageCache, key, url);
             return url;
         } catch (error) {
@@ -1339,7 +1348,7 @@ function parsePlainLyrics(raw: string, durationMs: number): LyricLine[] {
 }
 
 async function nativeFetchJson<T>(url: string): Promise<{ status: number; data: T | null; }> {
-    if (Native?.fetchJson) return await Native.fetchJson(url) as { status: number; data: T | null; };
+    if (Native?.fetchJson) return await Native.fetchJson(url, getLyricsProxy()) as { status: number; data: T | null; };
 
     const response = await fetch(url, {
         signal: fetchController?.signal,
@@ -1456,11 +1465,11 @@ function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean
 }
 
 async function fetchSpicyLyrics(track: NormalizedTrack): Promise<LoadedLyrics | null> {
-    const fetchNative = Native?.fetchSpicyLyrics as ((trackId: string, key: string) => Promise<{ status: number; data: { Body?: SpicyBody; } | null; retryAfter?: number; }>) | undefined;
+    const fetchNative = Native?.fetchSpicyLyrics as ((trackId: string, key: string, proxy: string) => Promise<{ status: number; data: { Body?: SpicyBody; } | null; retryAfter?: number; }>) | undefined;
     if (!fetchNative) return null;
 
     const key = getSpicyKey();
-    const response = await fetchNative(track.id, key);
+    const response = await fetchNative(track.id, key, getLyricsProxy());
 
     if (response.status === 401 || response.status === 403) {
         spicyRejectedKey = key;

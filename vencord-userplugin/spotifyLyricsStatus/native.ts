@@ -5,7 +5,7 @@
  */
 
 import { ChildProcess, spawn } from "child_process";
-import { IpcMainInvokeEvent } from "electron";
+import { IpcMainInvokeEvent, type Session, session } from "electron";
 import { appendFile, mkdir, rename, stat } from "fs/promises";
 import { join } from "path";
 
@@ -14,23 +14,51 @@ const debugLogPath = join(appDataDir, "debug.log");
 const DEBUG_LOG_MAX_BYTES = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 10000;
 
-async function fetchWithTimeout(url: string | URL, init: RequestInit = {}) {
-    return fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+// Requests go through Chromium's network stack (an Electron session), not Node's fetch: Node ignores the Windows
+// system proxy, so where LRCLIB/Spicy are blocked and a VPN client works as a system proxy (Clash, v2rayN, ...),
+// Discord itself loads but lyrics didn't. The session follows the system proxy like Discord does, or a proxy
+// set in the plugin settings.
+let netSession: Session | undefined;
+let netSessionProxy: string | undefined;
+
+function proxyConfig(proxy: string): Electron.ProxyConfig {
+    const value = String(proxy ?? "").trim();
+    if (value === "direct") return { mode: "direct" };
+    if (/^(https?|socks[45]?):\/\/[\w.-]+:\d{1,5}$/i.test(value)) return { proxyRules: value, proxyBypassRules: "<local>" };
+    return { mode: "system" };
 }
 
-export async function fetchJson(_: IpcMainInvokeEvent, url: string) {
+async function getNetSession(proxy: string) {
+    netSession ??= session.fromPartition("discordlyrics-net"); // in-memory: no cache or cookies on disk
+    const key = JSON.stringify(proxyConfig(proxy));
+    if (key !== netSessionProxy) {
+        await netSession.setProxy(proxyConfig(proxy));
+        netSessionProxy = key;
+    }
+    return netSession;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, proxy: string) {
+    const ses = await getNetSession(proxy);
+    // Covers the body too (callers read it after this returns); aborting a finished request is a no-op.
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS).unref?.();
+    return ses.fetch(url, { ...init, signal: controller.signal });
+}
+
+export async function fetchJson(_: IpcMainInvokeEvent, url: string, proxy = "") {
     try {
         const parsed = new URL(url);
         if (parsed.origin !== "https://lrclib.net") {
             return { status: 400, data: { error: "Only LRCLIB requests are allowed" } };
         }
 
-        const response = await fetchWithTimeout(parsed, {
+        const response = await fetchWithTimeout(parsed.href, {
             headers: {
                 Accept: "application/json",
                 "User-Agent": "Vencord SpotifyLyricsStatus"
             }
-        });
+        }, proxy);
 
         if (response.status === 404) return { status: 404, data: null };
 
@@ -48,7 +76,7 @@ export async function fetchJson(_: IpcMainInvokeEvent, url: string) {
 }
 
 // https://developers.spicylyrics.org/docs/reference/get.lyrics — the secret key only ever goes to api.spicylyrics.org.
-export async function fetchSpicyLyrics(_: IpcMainInvokeEvent, trackId: string, key: string) {
+export async function fetchSpicyLyrics(_: IpcMainInvokeEvent, trackId: string, key: string, proxy = "") {
     if (!/^[A-Za-z0-9]{22}$/.test(String(trackId))) return { status: 400, data: null };
     if (!/^sl_sk_\S+$/.test(String(key))) return { status: 401, data: null };
 
@@ -59,7 +87,7 @@ export async function fetchSpicyLyrics(_: IpcMainInvokeEvent, trackId: string, k
                 Authorization: `Bearer ${key}`,
                 "User-Agent": "DiscordLyrics (https://github.com/sh1guchi/DiscordLyrics)"
             }
-        });
+        }, proxy);
 
         const text = await response.text();
         let data: unknown = null;
@@ -108,7 +136,7 @@ function scoreAlbumImageResult(result: { trackName?: string; artistName?: string
     return score;
 }
 
-export async function searchAlbumImage(_: IpcMainInvokeEvent, title: string, artist: string, album: string) {
+export async function searchAlbumImage(_: IpcMainInvokeEvent, title: string, artist: string, album: string, proxy = "") {
     const query = [cleanQueryPart(title), cleanQueryPart(artist.split(",")[0] || artist), cleanQueryPart(album)].filter(Boolean).join(" ");
     if (!query) return "";
 
@@ -123,7 +151,7 @@ export async function searchAlbumImage(_: IpcMainInvokeEvent, title: string, art
                 Accept: "application/json",
                 "User-Agent": "DiscordLyrics"
             }
-        });
+        }, proxy);
         if (!response.ok) return "";
 
         const data = await response.json() as {
