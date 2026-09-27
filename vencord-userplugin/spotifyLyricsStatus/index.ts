@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.5";
+const RELEASE_VERSION = "1.0.6-personal.6";
 
 type FontStyleId =
     | "normal"
@@ -386,6 +386,16 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Show a Rich Presence card for the current Spotify song.",
         default: DEFAULT_SETTINGS.enableRpc
+    },
+    // Not in DEFAULT_SETTINGS, so "Reset defaults" keeps it.
+    rpcAppId: {
+        type: OptionType.STRING,
+        description: "Discord application ID for the Rich Presence card (discord.com/developers/applications → New Application → Application ID). Discord hides cards without a real application. Empty = built-in ID, if this build has one.",
+        default: "",
+        onChange: () => {
+            warnedMissingAppId = false;
+            lastRpcKey = "";
+        }
     },
     rpcName: {
         type: OptionType.STRING,
@@ -818,24 +828,29 @@ function rawSpotifyTrackKey(track: SpotifyTrack | null | undefined) {
     ].join("|");
 }
 
-function getSpotifyImageAsset(url: string) {
-    const match = cleanText(url).match(/^https?:\/\/i\.scdn\.co\/image\/([a-z0-9]+)$/i);
-    return match ? `spotify:${match[1]}` : undefined;
+// Discord drops Rich Presence activities that don't belong to a real application: the original plugin sent
+// application_id "0" (and Spotify-only "spotify:" image keys), so the card never reached anyone, you included.
+// Every Vencord plugin whose activity is visible (CustomRPC, MusicRichPresence) uses a real application ID.
+const BUILTIN_RPC_APP_ID = "";
+
+function getRpcAppId() {
+    const custom = cleanText(settings.store.rpcAppId);
+    if (/^\d{16,21}$/.test(custom)) return custom;
+    return /^\d{16,21}$/.test(BUILTIN_RPC_APP_ID) ? BUILTIN_RPC_APP_ID : "";
 }
 
-function getAlbumAsset(track: NormalizedTrack) {
+// Album art as an external asset of our application (mp:external/...), like MusicRichPresence does.
+function getAlbumAsset(track: NormalizedTrack, appId: string) {
     if (!settings.store.rpcShowAlbumArt || !track.albumImage) return undefined;
 
-    const spotifyAsset = getSpotifyImageAsset(track.albumImage);
-    if (spotifyAsset) return spotifyAsset;
+    const cacheKey = `${appId}|${track.albumImage}`;
+    if (albumAssetResolved.has(cacheKey)) return albumAssetResolved.get(cacheKey);
 
-    if (albumAssetResolved.has(track.albumImage)) return albumAssetResolved.get(track.albumImage);
-
-    if (!albumAssetCache.has(track.albumImage)) {
-        setBounded(albumAssetCache, track.albumImage, ApplicationAssetUtils.fetchAssetIds("0", [track.albumImage])
+    if (!albumAssetCache.has(cacheKey)) {
+        setBounded(albumAssetCache, cacheKey, ApplicationAssetUtils.fetchAssetIds(appId, [track.albumImage])
             .then(ids => {
                 const asset = ids[0];
-                setBounded(albumAssetResolved, track.albumImage, asset);
+                setBounded(albumAssetResolved, cacheKey, asset);
                 debugLog(`album art resolved "${track.albumImage}" -> "${asset ?? ""}"`);
                 const current = getCurrentTrack();
                 if (current && trackKey(current) === trackKey(track)) tick();
@@ -843,7 +858,7 @@ function getAlbumAsset(track: NormalizedTrack) {
             })
             .catch(error => {
                 console.warn("[SpotifyLyricsStatus] Could not fetch album art", error);
-                setBounded(albumAssetResolved, track.albumImage, undefined);
+                setBounded(albumAssetResolved, cacheKey, undefined);
                 return undefined;
             }));
     }
@@ -851,8 +866,20 @@ function getAlbumAsset(track: NormalizedTrack) {
     return undefined;
 }
 
+let warnedMissingAppId = false;
+
 function updateRpc(track: NormalizedTrack, paused = false) {
     if (!settings.store.enableRpc || (paused && !settings.store.rpcShowWhenPaused)) {
+        clearRpc();
+        return;
+    }
+
+    const appId = getRpcAppId();
+    if (!appId) {
+        if (!warnedMissingAppId) {
+            warnedMissingAppId = true;
+            debugLog("rich presence skipped: no Discord application ID (rpcAppId)");
+        }
         clearRpc();
         return;
     }
@@ -862,14 +889,14 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         ...track,
         albumImage: fallbackImage
     } : track;
-    const largeImage = getAlbumAsset(rpcTrack);
+    const largeImage = getAlbumAsset(rpcTrack, appId);
     const duration = normalizeDurationMs(rpcTrack.durationMs);
     const progress = Math.max(0, duration ? Math.min(track.progressMs, duration) : track.progressMs);
     const now = Date.now();
     const startedAt = paused || !duration ? 0 : now - progress;
     const credit = getLyricsCredit();
     const buttons = getRpcButtons(credit?.buttons ?? []);
-    const key = `${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.provider ?? ""}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`;
+    const key = `${appId}|${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.provider ?? ""}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`;
     const timingDrift = startedAt && lastRpcStartedAt ? Math.abs(startedAt - lastRpcStartedAt) : 0;
     if (key === lastRpcKey && (!startedAt || timingDrift < 5000)) return;
     lastRpcKey = key;
@@ -879,7 +906,7 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         ? DEFAULT_SETTINGS.rpcName
         : settings.store.rpcName || DEFAULT_SETTINGS.rpcName;
     const activity: Activity = {
-        application_id: "0",
+        application_id: appId,
         name: credit ? `${rpcName} · lyrics: ${credit.provider}` : rpcName,
         ...(buttons.length ? {
             buttons: buttons.map(button => button.label),
@@ -1421,12 +1448,13 @@ function getSpicyKey() {
 }
 
 // Spicy's terms require crediting the source next to the lyrics; this plugin does that on the Rich Presence card,
-// so without the card Spicy isn't used at all.
+// so without a card others can actually see (Rich Presence on + a real application ID) Spicy isn't used at all.
 function canUseSpicy(track: NormalizedTrack) {
     const key = getSpicyKey();
     return Boolean(key)
         && key !== spicyRejectedKey
         && settings.store.enableRpc
+        && Boolean(getRpcAppId())
         && /^[A-Za-z0-9]{22}$/.test(track.id)
         && Date.now() >= spicyMutedUntil;
 }
