@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.6";
+const RELEASE_VERSION = "1.0.6-personal.7";
 
 type FontStyleId =
     | "normal"
@@ -894,9 +894,9 @@ function updateRpc(track: NormalizedTrack, paused = false) {
     const progress = Math.max(0, duration ? Math.min(track.progressMs, duration) : track.progressMs);
     const now = Date.now();
     const startedAt = paused || !duration ? 0 : now - progress;
-    const credit = getLyricsCredit();
+    const credit = getLyricsCredit(Boolean(largeImage));
     const buttons = getRpcButtons(credit?.buttons ?? []);
-    const key = `${appId}|${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.provider ?? ""}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`;
+    const key = `${appId}|${trackKey(rpcTrack)}|${paused}|${largeImage ?? ""}|${duration}|${credit?.provider ?? ""}|${credit?.coverUrl ?? ""}|${buttons.map(button => `${button.label}>${button.url}`).join("|")}`;
     const timingDrift = startedAt && lastRpcStartedAt ? Math.abs(startedAt - lastRpcStartedAt) : 0;
     if (key === lastRpcKey && (!startedAt || timingDrift < 5000)) return;
     lastRpcKey = key;
@@ -921,7 +921,8 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         },
         assets: largeImage ? {
             large_image: largeImage,
-            large_text: rpcTrack.album || rpcTrack.title
+            large_text: rpcTrack.album || rpcTrack.title,
+            ...(credit?.coverUrl ? { large_url: credit.coverUrl } : {})
         } : undefined,
         status_display_type: ActivityStatusDisplayType.DETAILS,
         flags: ActivityFlags.INSTANCE
@@ -938,7 +939,7 @@ function updateRpc(track: NormalizedTrack, paused = false) {
 // Credit for the lyrics in the status, shown on the Rich Presence card (Spicy Lyrics terms: always name the provider;
 // for community syncs also link the uploader and the maker). The header is visible to everyone including you; Discord
 // hides your own activity buttons from you, but everyone else sees them.
-function getLyricsCredit() {
+function getLyricsCredit(hasCover: boolean) {
     const attribution = lyricsAttribution;
     if (!attribution) return undefined;
 
@@ -948,13 +949,29 @@ function getLyricsCredit() {
         attribution.maker && { role: "Synced by", ...attribution.maker }
     ].filter(Boolean) as Array<{ role: string; username: string; url?: string; }>;
     const unique = people.filter((person, index) => people.findIndex(other => other.username === person.username) === index);
+
+    // Two different people: name both on one button (linked to the uploader) and make the cover link to the maker,
+    // which leaves the second button free. Only when both names fit and the maker's link has somewhere to go;
+    // otherwise one button each, so nobody loses their credit or link.
+    if (unique.length === 2) {
+        const [uploader, maker] = unique;
+        const combined = `Sync: @${uploader.username} & @${maker.username}`;
+        if ([...combined].length <= 32 && (hasCover || !maker.url)) {
+            return {
+                provider: attribution.provider,
+                buttons: [{ label: combined, url: uploader.url ?? "https://spicylyrics.org" }],
+                coverUrl: maker.url
+            };
+        }
+    }
+
     const buttons = unique.map(person => ({
         // Same person uploaded and synced: one button covers both.
         label: fitLabel(unique.length < people.length ? `Synced by @${person.username}` : `${person.role} @${person.username}`),
         url: person.url ?? "https://spicylyrics.org"
     }));
 
-    return { provider: attribution.provider, buttons };
+    return { provider: attribution.provider, buttons, coverUrl: undefined as string | undefined };
 }
 
 const PLUGIN_URL = "https://github.com/sh1guchi/DiscordLyrics";
