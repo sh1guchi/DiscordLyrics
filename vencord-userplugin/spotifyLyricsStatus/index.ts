@@ -28,13 +28,14 @@ const DEFAULT_SETTINGS = {
     enableRpc: true,
     rpcName: "Spotify",
     rpcShowWhenPaused: true,
+    pauseClearMinutes: 5,
     rpcShowAlbumArt: true,
     rpcShowPluginButton: false,
     windowsMediaFallback: true,
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.11";
+const RELEASE_VERSION = "1.0.6-personal.12";
 
 type FontStyleId =
     | "normal"
@@ -247,7 +248,20 @@ let spotifyPollInFlight = false;
 let lastPlaybackPlaying: boolean | undefined;
 let spotifyUnavailableAt = 0;
 let spotifyPollMutedUntil = 0;
-let statusExpiryCleared = false;
+// When the custom status Discord holds for us expires on its own (safety net, see refreshStatusExpiry).
+let statusExpiresAt = 0;
+let statusExpiryInFlight = false;
+// Last non-empty text we put into the custom status: only that may be cleared on our own, never a status the user set.
+let lastSentStatusText = "";
+let lastIdleStatusCheckAt = 0;
+// Is our Rich Presence card currently dispatched? Tracked separately from lastRpcKey, which gets reset to force redraws.
+let rpcShown = false;
+// Pause start, for clearing everything after pauseClearMinutes.
+let pausedSince = 0;
+// Consecutive Spotify Web API answers of "nothing is playing".
+let spotifyApiEmptyPolls = 0;
+// Last SPOTIFY_PLAYER_STATE from Discord; a Web API answer to a request sent before it is older news.
+let lastSpotifyEventAt = 0;
 
 const STATUS_SOCKET_ID = "SpotifyLyricsStatus";
 const RPC_SOCKET_ID = "SpotifyLyricsStatusRpc";
@@ -262,6 +276,13 @@ const WINDOWS_SPOTIFY_STATE_FRESH_MS = 5000;
 const WINDOWS_SPOTIFY_PROCESS_GRACE_MS = 15000;
 const SPOTIFY_UNAVAILABLE_GRACE_MS = 5000;
 const LAST_KNOWN_SPOTIFY_TRACK_MS = 30 * 60 * 1000;
+// Two "nothing playing" answers in a row (~10 s) outrank whatever track Discord's store still remembers.
+const SPOTIFY_API_IDLE_POLLS = 2;
+// Custom status lives on Discord's servers: if Discord quits, crashes or the PC sleeps, the clear request never goes
+// out. So the status always carries an expiry ~15 min ahead, pushed forward while we're running.
+const STATUS_EXPIRY_MS = 15 * 60 * 1000;
+const STATUS_EXPIRY_REFRESH_MS = 10 * 60 * 1000;
+const IDLE_STATUS_CHECK_MS = 30000;
 const CACHE_LIMIT = 200;
 const LYRICS_CACHE_LIMIT = 50;
 const albumAssetCache = new Map<string, Promise<string | undefined>>();
@@ -408,6 +429,11 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Keep the Rich Presence card visible while Spotify is paused.",
         default: DEFAULT_SETTINGS.rpcShowWhenPaused
+    },
+    pauseClearMinutes: {
+        type: OptionType.NUMBER,
+        description: "After this many minutes on pause, clear the status and the Rich Presence card as if nothing is playing. 0 = clear right away on pause.",
+        default: DEFAULT_SETTINGS.pauseClearMinutes
     },
     rpcShowAlbumArt: {
         type: OptionType.BOOLEAN,
@@ -695,7 +721,11 @@ function forceRemoteStatus(status: string, reason: string) {
 let lastStatusResyncCheckAt = 0;
 
 function ensureRemoteStatusMatches(status: string) {
-    if (!status || isWaitingStatus(status)) return;
+    if (!status) {
+        ensureRemoteStatusCleared();
+        return;
+    }
+    if (isWaitingStatus(status)) return;
     // Runs every tick; checking (and possibly re-sending) at most every 30 s is plenty.
     if (Date.now() - lastStatusResyncCheckAt < 30000) return;
     lastStatusResyncCheckAt = Date.now();
@@ -705,6 +735,24 @@ function ensureRemoteStatusMatches(status: string) {
         forceRemoteStatus(status, `actual="${currentStatus}"`);
         return;
     }
+}
+
+// Nothing is playing but Discord still shows a line we set (the clear request failed, or was never sent because
+// Discord was closed mid-song): clear it again. A status the user typed themselves is never touched.
+function ensureRemoteStatusCleared() {
+    if (!lastSentStatusText || remoteStatusInFlight) return;
+    if (Date.now() - lastIdleStatusCheckAt < IDLE_STATUS_CHECK_MS) return;
+    lastIdleStatusCheckAt = Date.now();
+
+    const actual = getCurrentCustomStatusText();
+    if (!actual) {
+        lastSentStatusText = ""; // confirmed clear: from now on any status there is the user's own
+        return;
+    }
+    if (actual !== lastSentStatusText) return;
+    debugLog(`custom status still shows "${lastSentStatusText}" while idle; clearing again`);
+    lastRemoteStatusText = undefined;
+    setRemoteStatus("", true);
 }
 
 function setProfileStatus(text: string) {
@@ -790,16 +838,16 @@ async function flushRemoteStatus() {
         const wasEmpty = !lastRemoteStatusText;
         await customStatus.updateSetting(status ? { text: status } : undefined);
 
-        // Expiry and creation time only need to be written once, not with every lyric line (3 requests -> 1).
-        if (status && !statusExpiryCleared) {
-            await getStatusSetting("statusExpiresAtMs")?.updateSetting("0");
-            statusExpiryCleared = true;
-        }
+        // Expiry and creation time aren't written with every lyric line (3 requests -> 1): the expiry only when it
+        // needs pushing forward, the creation time only when the status goes from empty to set.
+        if (status) await writeStatusExpiry();
+        else statusExpiresAt = 0;
 
         if (status && wasEmpty) {
             await getStatusSetting("statusCreatedAtMs")?.updateSetting({ value: String(Date.now()) });
         }
 
+        if (status) lastSentStatusText = status;
         lastRemoteStatusText = status;
         nextRemoteStatusAt = Date.now() + MIN_REMOTE_STATUS_INTERVAL_MS;
         debugLog(`custom status update ok "${status}"`);
@@ -811,6 +859,27 @@ async function flushRemoteStatus() {
         remoteStatusInFlight = false;
         if (pendingRemoteStatusText !== lastRemoteStatusText) scheduleRemoteStatusFlush();
     }
+}
+
+// Safety net for "status stuck forever": keep the status's own expiry at most STATUS_EXPIRY_MS ahead and push it
+// forward once less than STATUS_EXPIRY_REFRESH_MS is left (~1 extra request per 5 min while a status is shown).
+async function writeStatusExpiry(force = false) {
+    if (!force && statusExpiresAt - Date.now() >= STATUS_EXPIRY_REFRESH_MS) return;
+    const expiresAt = Date.now() + STATUS_EXPIRY_MS;
+    await getStatusSetting("statusExpiresAtMs")?.updateSetting(String(expiresAt));
+    statusExpiresAt = expiresAt;
+}
+
+// Called every tick: a status that doesn't change for a while (long pause, long instrumental) still gets its expiry
+// pushed forward, so Discord never clears it while we're running.
+function refreshStatusExpiry() {
+    if (!lastRemoteStatusText || remoteStatusInFlight || statusExpiryInFlight) return;
+    if (statusExpiresAt - Date.now() >= STATUS_EXPIRY_REFRESH_MS) return;
+
+    statusExpiryInFlight = true;
+    writeStatusExpiry()
+        .catch(error => debugLog(`status expiry refresh failed ${stringifyError(error)}`))
+        .finally(() => { statusExpiryInFlight = false; });
 }
 
 function stringifyError(error: unknown) {
@@ -837,9 +906,12 @@ function getRetryAfterMs(error: unknown) {
 }
 
 function clearRpc() {
-    if (!lastRpcKey) return;
     lastRpcKey = "";
     lastRpcStartedAt = 0;
+    // Keyed on whether a card is actually up, not on lastRpcKey: that key is also reset just to force a redraw
+    // (cover loaded, app ID changed), and the original then skipped the clear and left a stale card behind.
+    if (!rpcShown) return;
+    rpcShown = false;
     FluxDispatcher.dispatch({
         type: "LOCAL_ACTIVITY_UPDATE",
         activity: null,
@@ -977,6 +1049,7 @@ function updateRpc(track: NormalizedTrack, paused = false) {
         activity,
         socketId: RPC_SOCKET_ID,
     });
+    rpcShown = true;
     debugLog(`rpc update ${paused ? "paused" : "playing"} "${track.title}" progress=${Math.round(progress)}ms duration=${duration}ms start=${startedAt || ""} image=${largeImage ?? ""}`);
 }
 
@@ -1206,7 +1279,10 @@ function getCurrentTrack(): NormalizedTrack | undefined {
     const storePosition = Number(SpotifyStore.position ?? NaN);
     const storeHasPosition = Number.isFinite(storePosition) && storePosition >= 0;
     const storeRawKey = rawSpotifyTrackKey(storeTrack);
+    // Spotify itself says nothing is playing: whatever Discord's store remembers is stale.
+    const spotifyApiIdle = spotifyApiEmptyPolls >= SPOTIFY_API_IDLE_POLLS;
     const storeHasTrack = Boolean(storeTrack?.name)
+        && !spotifyApiIdle
         && (!recentlyUnavailable || Boolean(SpotifyStore.isPlaying) || (storeRawKey && storeRawKey !== lastTrackKey));
     const storeChangedTrack = storeHasTrack
         && Boolean(stateTrack?.name)
@@ -1226,7 +1302,8 @@ function getCurrentTrack(): NormalizedTrack | undefined {
         }
 
         if (
-            (windowsSpotifyProcessRunning || Date.now() - windowsSpotifyProcessSeenAt < WINDOWS_SPOTIFY_PROCESS_GRACE_MS)
+            !spotifyApiIdle
+            && (windowsSpotifyProcessRunning || Date.now() - windowsSpotifyProcessSeenAt < WINDOWS_SPOTIFY_PROCESS_GRACE_MS)
             && lastKnownSpotifyTrack
             && Date.now() - lastKnownSpotifyTrackAt < LAST_KNOWN_SPOTIFY_TRACK_MS
         ) {
@@ -1307,17 +1384,27 @@ async function pollSpotifyPlayer(force = false) {
 
     try {
         const player = await request.call(SpotifyStore, "get", "/currently-playing");
+        // You paused (or skipped) while this request was out: Discord's event is newer, keep it. Otherwise the
+        // "playing" answer would put the lyric back for up to one poll interval.
+        if (lastSpotifyEventAt > now) return;
         if (!player?.item) {
-            const stateAge = spotifyState?.receivedAt ? Date.now() - spotifyState.receivedAt : Number.POSITIVE_INFINITY;
-            if ((spotifyState?.track && stateAge < SPOTIFY_STATE_FRESH_MS) || SpotifyStore.track?.name) {
-                return;
-            }
+            // Podcasts and ads come back with no item while is_playing is true: that's not "nothing playing".
+            if (player?.is_playing) return;
+
+            // Nothing is playing on any device. The original ignored this whenever Discord's store still remembered a
+            // track, which kept a stale lyric/pause status up after Spotify stopped or closed. One empty answer may be
+            // a hiccup; two in a row (~10 s) win over the remembered track.
+            spotifyApiEmptyPolls++;
+            if (spotifyApiEmptyPolls < SPOTIFY_API_IDLE_POLLS) return;
+            if (spotifyApiEmptyPolls === SPOTIFY_API_IDLE_POLLS) debugLog("spotify api: nothing playing, dropping the remembered track");
 
             spotifyState = undefined;
             spotifyUnavailableAt = Date.now();
             tick();
             return;
         }
+
+        spotifyApiEmptyPolls = 0;
 
         const image = player.item.album?.images?.[0];
         spotifyUnavailableAt = 0;
@@ -1949,11 +2036,13 @@ function lyricAt(progressMs: number): ActiveLyricLine | undefined {
 function tick() {
     void pollSpotifyPlayer();
     if (!discordHasSpotifyData()) void pollWindowsSpotifyState();
+    refreshStatusExpiry();
 
     const track = getCurrentTrack();
 
     if (!track) {
         lastPlaybackPlaying = undefined;
+        pausedSince = 0;
         if (!windowsSpotifyProcessRunning && Date.now() - windowsSpotifyProcessSeenAt > WINDOWS_SPOTIFY_PROCESS_GRACE_MS) {
             lastTrackKey = "";
             loadingTrackKey = "";
@@ -1968,6 +2057,16 @@ function tick() {
 
     if (!track.isPlaying) {
         lastPlaybackPlaying = false;
+        pausedSince ||= Date.now();
+
+        // Paused long enough: treat it as "nothing playing" (Discord can remember a paused track for hours).
+        const pauseLimitMs = Math.max(0, getStoredNumber("pauseClearMinutes", DEFAULT_SETTINGS.pauseClearMinutes)) * 60000;
+        if (Date.now() - pausedSince >= pauseLimitMs) {
+            setProfileStatus("");
+            clearRpc();
+            return;
+        }
+
         const pausedText = `${settings.store.pausedPrefix}${track.title}`;
         setProfileStatus(formatStatus(pausedText, false));
         updateRpc(track, true);
@@ -1976,6 +2075,7 @@ function tick() {
 
     const resumedFromPause = lastPlaybackPlaying === false;
     lastPlaybackPlaying = true;
+    pausedSince = 0;
 
     const key = trackKey(track);
     if (key !== lastTrackKey) prepareTrack(track);
@@ -2018,12 +2118,15 @@ function onSpotifyPlayerState(event: SpotifyStateEvent) {
     if (!event?.track) {
         spotifyState = undefined;
         spotifyUnavailableAt = Date.now();
+        lastSpotifyEventAt = Date.now();
         debugLog("spotify event cleared");
         void pollWindowsSpotifyState(true).then(() => tick());
         return;
     }
 
     spotifyUnavailableAt = 0;
+    spotifyApiEmptyPolls = 0; // Discord just pushed a live track: the API's earlier "nothing playing" is outdated
+    lastSpotifyEventAt = Date.now();
     spotifyState = { ...event, receivedAt: Date.now() };
     debugLog(`spotify event ${event.isPlaying ? "playing" : "paused"} "${event.track?.name ?? ""}" ${event.position}ms`);
     const track = getCurrentTrack();
@@ -2032,10 +2135,17 @@ function onSpotifyPlayerState(event: SpotifyStateEvent) {
     tick();
 }
 
+// Plugin stopped or Discord closing. The original reset lastStatusText first, so setProfileStatus("") returned
+// early and the local status activity was never cleared. On a real quit the request may not make it out in time;
+// the status expiry (refreshStatusExpiry) then clears it on Discord's side within ~15 min.
 function clearStatusForShutdown() {
-    pendingRemoteStatusText = "";
-    lastStatusText = "";
     setProfileStatus("");
+    pendingRemoteStatusText = "";
+    nextRemoteStatusAt = 0;
+    if (remoteStatusTimer) {
+        clearTimeout(remoteStatusTimer);
+        remoteStatusTimer = undefined;
+    }
     void flushRemoteStatus();
     clearRpc();
 }
@@ -2057,6 +2167,9 @@ export default definePlugin({
         window.addEventListener("pagehide", clearStatusForShutdown);
         restartTimer();
         logStatusUserSettings();
+        // Leftovers from a previous run (plugin reload, crash): drop our card and the status.
+        rpcShown = true;
+        clearRpc();
         setRemoteStatus("");
         void pollSpotifyPlayer(true);
         tick();
@@ -2075,7 +2188,8 @@ export default definePlugin({
         fetchController = undefined;
         void (Native?.stopWindowsSpotifyWatcher?.() as Promise<void> | undefined)?.catch(() => void 0);
         statusSettingCache.clear();
-        statusExpiryCleared = false;
+        pausedSince = 0;
+        spotifyApiEmptyPolls = 0;
         spotifyState = undefined;
         windowsSpotifyTrack = undefined;
         windowsSpotifyTrackReceivedAt = 0;
