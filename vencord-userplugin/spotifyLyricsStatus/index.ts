@@ -35,7 +35,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.12";
+const RELEASE_VERSION = "1.0.6-personal.13";
 
 type FontStyleId =
     | "normal"
@@ -693,12 +693,11 @@ function restartTimer() {
     interval = setInterval(tick, getTickMs());
 }
 
+// Static on purpose: the original animated "." ".." "..." every 700 ms as a local activity, and every frame was a
+// presence update to Discord's gateway (up to ~50 a minute together with lyric lines). Discord throttles those, so
+// the Rich Presence card for a new song got stuck behind them for up to a minute.
 function getWaitingStatus() {
-    return ".".repeat(Math.floor(Date.now() / 700) % 3 + 1);
-}
-
-function isWaitingStatus(status: string) {
-    return /^\.{1,3}$/.test(status) || status === settings.store.loadingText || status === settings.store.noLyricsText;
+    return "...";
 }
 
 function getCurrentCustomStatusText() {
@@ -711,7 +710,7 @@ function getCurrentCustomStatusText() {
 }
 
 function forceRemoteStatus(status: string, reason: string) {
-    if (!status || isWaitingStatus(status)) return;
+    if (!status) return;
 
     debugLog(`custom status force "${status}" ${reason}`);
     lastRemoteStatusText = undefined;
@@ -725,7 +724,6 @@ function ensureRemoteStatusMatches(status: string) {
         ensureRemoteStatusCleared();
         return;
     }
-    if (isWaitingStatus(status)) return;
     // Runs every tick; checking (and possibly re-sending) at most every 30 s is plenty.
     if (Date.now() - lastStatusResyncCheckAt < 30000) return;
     lastStatusResyncCheckAt = Date.now();
@@ -755,47 +753,25 @@ function ensureRemoteStatusCleared() {
     setRemoteStatus("", true);
 }
 
+// Everything goes through the custom status setting (at most 1 request/s). The original also mirrored every
+// status into a local CUSTOM_STATUS activity; Discord sends each local activity change to its gateway as a
+// presence update, which flooded the presence rate limit and delayed the Rich Presence card. The setting alone
+// already updates your own UI instantly.
 function setProfileStatus(text: string) {
     // Callers pass text already sized by formatStatus(); only enforce Discord's hard limit here.
     const status = truncateStatus(text, false);
-    const waitingStatus = isWaitingStatus(status);
 
     if (status === lastStatusText) {
         ensureRemoteStatusMatches(status);
         return;
     }
     lastStatusText = status;
-    debugLog(`local status "${status}"`);
+    debugLog(`status "${status}"`);
 
-    if (waitingStatus) {
-        clearPendingWaitingRemoteStatus();
-    } else if (getCurrentCustomStatusText() !== status && lastRemoteStatusText === status) {
+    if (status && getCurrentCustomStatusText() !== status && lastRemoteStatusText === status) {
         forceRemoteStatus(status, "cache-mismatch");
     } else {
         setRemoteStatus(status, true);
-    }
-
-    FluxDispatcher.dispatch({
-        type: "LOCAL_ACTIVITY_UPDATE",
-        activity: status ? {
-            id: "custom",
-            name: "Custom Status",
-            state: status,
-            type: ActivityType.CUSTOM_STATUS,
-            flags: ActivityFlags.INSTANCE,
-            created_at: Date.now()
-        } satisfies Activity : null,
-        socketId: STATUS_SOCKET_ID,
-    });
-}
-
-function clearPendingWaitingRemoteStatus() {
-    if (!isWaitingStatus(pendingRemoteStatusText)) return;
-
-    pendingRemoteStatusText = lastRemoteStatusText ?? "";
-    if (remoteStatusTimer) {
-        clearTimeout(remoteStatusTimer);
-        remoteStatusTimer = undefined;
     }
 }
 
@@ -1456,14 +1432,10 @@ function supportsSyncedLyrics(track: NormalizedTrack) {
     return !track.contentType || track.contentType === "track" || track.contentType === "song";
 }
 
+// The same tick sets the new track's status (lyric, "..." or loading text); sending "" first would just be an
+// extra request and a flash of an empty status.
 function clearProfileStatusForTrackChange() {
     lastStatusText = "";
-    setRemoteStatus("", true);
-    FluxDispatcher.dispatch({
-        type: "LOCAL_ACTIVITY_UPDATE",
-        activity: null,
-        socketId: STATUS_SOCKET_ID,
-    });
 }
 
 function prepareTrack(track: NormalizedTrack) {
@@ -2073,7 +2045,6 @@ function tick() {
         return;
     }
 
-    const resumedFromPause = lastPlaybackPlaying === false;
     lastPlaybackPlaying = true;
     pausedSince = 0;
 
@@ -2094,22 +2065,10 @@ function tick() {
     }
 
     if (settings.store.showWaitingDots) {
-        if (resumedFromPause) {
-            debugLog("play resumed before next lyric; clearing remote pause status");
-            setRemoteStatus("", true);
-        }
         setProfileStatus(getWaitingStatus());
     } else if (lastTrackKey === loadingTrackKey) {
-        if (resumedFromPause) {
-            debugLog("play resumed while loading lyrics; clearing remote pause status");
-            setRemoteStatus("", true);
-        }
         setProfileStatus(formatStatus(settings.store.loadingText, false));
     } else {
-        if (resumedFromPause) {
-            debugLog("play resumed with no lyric; clearing remote pause status");
-            setRemoteStatus("", true);
-        }
         setProfileStatus(formatStatus(settings.store.noLyricsText, false));
     }
 }
@@ -2167,9 +2126,11 @@ export default definePlugin({
         window.addEventListener("pagehide", clearStatusForShutdown);
         restartTimer();
         logStatusUserSettings();
-        // Leftovers from a previous run (plugin reload, crash): drop our card and the status.
+        // Leftovers from a previous run (plugin reload, crash): drop our card, the local status activity older
+        // versions dispatched, and the status.
         rpcShown = true;
         clearRpc();
+        FluxDispatcher.dispatch({ type: "LOCAL_ACTIVITY_UPDATE", activity: null, socketId: STATUS_SOCKET_ID });
         setRemoteStatus("");
         void pollSpotifyPlayer(true);
         tick();
