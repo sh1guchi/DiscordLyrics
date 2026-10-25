@@ -10,7 +10,7 @@ import { SpotifyStore } from "@plugins/spotifyControls/SpotifyStore";
 import definePlugin, { OptionType, type PluginNative } from "@utils/types";
 import type { Activity } from "@vencord/discord-types";
 import { ActivityFlags, ActivityStatusDisplayType, ActivityType } from "@vencord/discord-types/enums";
-import { ApplicationAssetUtils, Button, FluxDispatcher, React, showToast, Toasts, UserStore } from "@webpack/common";
+import { ApplicationAssetUtils, Button, FluxDispatcher, React, showToast, UserStore } from "@webpack/common";
 
 const Native = (VencordNative.pluginHelpers.DiscordLyrics ?? VencordNative.pluginHelpers.SpotifyLyricsStatus) as PluginNative<typeof import("./native")>;
 
@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.10";
+const RELEASE_VERSION = "1.0.6-personal.11";
 
 type FontStyleId =
     | "normal"
@@ -337,7 +337,7 @@ function resetPluginDefaults() {
 
     restartTimer();
     tick();
-    showToast("DiscordLyrics settings reset", Toasts.Type.SUCCESS);
+    showToast({ text: "DiscordLyrics settings reset", variant: "success" });
 }
 
 const settings = definePluginSettings({
@@ -924,7 +924,7 @@ function updateRpc(track: NormalizedTrack, paused = false) {
 
     if (!isActivitySharingOn() && !warnedActivitySharingOff) {
         warnedActivitySharingOff = true;
-        showToast("DiscordLyrics: Activity Sharing is off, only you can see the Rich Presence card", Toasts.Type.FAILURE);
+        showToast({ text: "DiscordLyrics: Activity Sharing is off, only you can see the Rich Presence card", variant: "critical" });
         debugLog("activity sharing (status.showCurrentGame) is off: rich presence is local-only");
     }
 
@@ -1582,7 +1582,7 @@ async function fetchSpicyLyrics(track: NormalizedTrack): Promise<LoadedLyrics | 
 
     if (response.status === 401 || response.status === 403) {
         spicyRejectedKey = key;
-        showToast("DiscordLyrics: Spicy Lyrics rejected the API key, using LRCLIB", Toasts.Type.FAILURE);
+        showToast({ text: "DiscordLyrics: Spicy Lyrics rejected the API key, using LRCLIB", variant: "critical" });
         return null;
     }
     if (response.status === 429 || response.status >= 500 || response.status < 0) {
@@ -2060,7 +2060,7 @@ export default definePlugin({
         setRemoteStatus("");
         void pollSpotifyPlayer(true);
         tick();
-        showToast("DiscordLyrics started", Toasts.Type.SUCCESS);
+        showToast({ text: "DiscordLyrics started", variant: "success" });
     },
 
     stop() {
