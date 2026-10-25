@@ -17,7 +17,6 @@ const Native = (VencordNative.pluginHelpers.DiscordLyrics ?? VencordNative.plugi
 const DEFAULT_SETTINGS = {
     lyricOffsetMs: 650,
     updateIntervalMs: 250,
-    gapThresholdMs: 4000,
     maxStatusLength: 128,
     fontStyle: "normal",
     showWaitingDots: true,
@@ -35,7 +34,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.15";
+const RELEASE_VERSION = "1.0.6-personal.16";
 
 type FontStyleId =
     | "normal"
@@ -154,6 +153,8 @@ interface LyricLine {
     wordTimesMs?: number[];
     // When each of those words has finished being sung.
     wordEndTimesMs?: number[];
+    // When the whole line has been sung, if the source says (Spicy end times, LRC blank-line markers).
+    endTimeMs?: number;
 }
 
 // Who to credit for the lyrics on screen (Spicy Lyrics API terms, section 6).
@@ -179,8 +180,10 @@ interface SpicyBody {
     Content?: Array<{
         Text?: string;
         StartTime?: number;
+        EndTime?: number;
         Lead?: {
             StartTime?: number;
+            EndTime?: number;
             Syllables?: Array<{ Text?: string; StartTime?: number; EndTime?: number; IsPartOfWord?: boolean; }>;
         };
     }>;
@@ -190,6 +193,8 @@ interface SpicyBody {
 
 interface ActiveLyricLine extends LyricLine {
     nextTimeMs?: number;
+    // Progress time (includes lyricOffsetMs) at which this line leaves the status: the next line, or "..." taking over.
+    visibleUntilMs?: number;
 }
 
 interface LrcLibResult {
@@ -372,7 +377,7 @@ const settings = definePluginSettings({
     },
     showWaitingDots: {
         type: OptionType.BOOLEAN,
-        description: "Show dots during intros and long lyric gaps.",
+        description: "Show \"...\" during instrumental breaks, like Spicy Lyrics: intros and gaps of at least 3 s between a line's end and the next line. Shorter pauses keep the line up.",
         default: DEFAULT_SETTINGS.showWaitingDots
     },
     loadingText: {
@@ -1508,8 +1513,10 @@ function nonSongStatus(track: NormalizedTrack) {
     return track.artist ? `${label} - ${track.title}` : `${label} - ${track.title}`;
 }
 
+// A timed blank line in LRC marks where the previous line ends (that's how LRC encodes instrumental breaks), so it
+// becomes that line's endTimeMs instead of being dropped.
 function parseSyncedLyrics(raw: string): LyricLine[] {
-    return raw
+    const entries = raw
         .split(/\r?\n/)
         .map(line => {
             const match = line.match(/^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.*)$/);
@@ -1518,11 +1525,18 @@ function parseSyncedLyrics(raw: string): LyricLine[] {
             const minutes = Number(match[1]);
             const seconds = Number(match[2]);
             const millis = Number((match[3] || "0").padEnd(3, "0").slice(0, 3));
-            const text = cleanText(match[4]).replace(/\s*\[[^\]]+\]\s*/g, " ");
-            return text ? { timeMs: minutes * 60000 + seconds * 1000 + millis, text } : null;
+            const text = cleanText(cleanText(match[4]).replace(/\s*\[[^\]]+\]\s*/g, " "));
+            return { timeMs: minutes * 60000 + seconds * 1000 + millis, text };
         })
         .filter(Boolean)
         .sort((a, b) => a!.timeMs - b!.timeMs) as LyricLine[];
+
+    return entries
+        .map((entry, i) => {
+            const next = entries[i + 1];
+            return next && !next.text ? { ...entry, endTimeMs: next.timeMs } : entry;
+        })
+        .filter(entry => entry.text);
 }
 
 function parsePlainLyrics(raw: string, durationMs: number): LyricLine[] {
@@ -1642,7 +1656,8 @@ function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean
                 text: flat.map(word => word.text).join(" "),
                 wordTimesMs: flat.map(word => word.startMs),
                 // Missing/invalid end time: assume the word lasts until the next one starts.
-                wordEndTimesMs: flat.map((word, i) => word.endMs > word.startMs ? word.endMs : (flat[i + 1]?.startMs ?? word.startMs))
+                wordEndTimesMs: flat.map((word, i) => word.endMs > word.startMs ? word.endMs : (flat[i + 1]?.startMs ?? word.startMs)),
+                endTimeMs: Number(entry.Lead?.EndTime ?? 0) * 1000 || Math.max(...flat.map(word => word.endMs)) || undefined
             });
         }
         return { lines: lines.sort((a, b) => a.timeMs - b.timeMs), synced: true };
@@ -1650,7 +1665,11 @@ function parseSpicyLines(body: SpicyBody): { lines: LyricLine[]; synced: boolean
 
     if (body.Type === "Line") {
         const lines = (body.Content ?? [])
-            .map(entry => ({ timeMs: Number(entry.StartTime ?? 0) * 1000, text: cleanText(entry.Text) }))
+            .map(entry => ({
+                timeMs: Number(entry.StartTime ?? 0) * 1000,
+                text: cleanText(entry.Text),
+                endTimeMs: Number(entry.EndTime ?? 0) * 1000 || undefined
+            }))
             .filter(line => line.text)
             .sort((a, b) => a.timeMs - b.timeMs);
         return { lines, synced: true };
@@ -1896,26 +1915,29 @@ function computeLyricChunks(text: string, maxLength: number) {
     return chunks.length ? chunks : [cleanText(text)];
 }
 
-function getGapThresholdMs() {
-    return Math.max(3000, getStoredNumber("gapThresholdMs", DEFAULT_SETTINGS.gapThresholdMs));
-}
-
 function estimatedPageCount(text: string) {
     return Math.max(1, Math.ceil([...cleanText(text)].length / Math.max(8, getLyricChunkLimit())));
 }
 
-// Before a long instrumental gap the line is replaced by waiting dots; keep it up long enough to page through.
-function waitingDotsAfterMs(text: string, gapMs: number) {
-    return Math.min(gapMs - 250, Math.max(2600, estimatedPageCount(text) * (MIN_PAGE_MS + 400)));
+// Same rule as Spicy Lyrics' "•••" (lyrics.ts getLyricsBetweenShow): only a gap of at least 3 s between a line's end
+// and the next line's start is an instrumental break. Shorter pauses keep the line up until the next one starts.
+const INTERLUDE_MIN_MS = 3000;
+
+function getLyricOffsetMs() {
+    return getStoredNumber("lyricOffsetMs", DEFAULT_SETTINGS.lyricOffsetMs);
 }
 
-// How long the line is actually on screen: until the next line, or until waiting dots take over.
-function lineDisplayMs(line: ActiveLyricLine) {
-    if (line.nextTimeMs === undefined) return Math.max(3000, estimatedPageCount(line.text) * 2200);
+// Song time at which "..." replaces this line, or undefined when it simply stays until the next line. Needs the
+// line's end time (Spicy gives it; LRC marks it with a blank timed line); without one there's no break to show.
+function interludeStartMs(line: LyricLine, next: LyricLine | undefined) {
+    if (!settings.store.showWaitingDots || !next || line.endTimeMs === undefined) return undefined;
+    return next.timeMs - line.endTimeMs >= INTERLUDE_MIN_MS ? line.endTimeMs : undefined;
+}
 
-    const gapMs = line.nextTimeMs - line.timeMs;
-    if (settings.store.showWaitingDots && gapMs >= getGapThresholdMs()) return waitingDotsAfterMs(line.text, gapMs);
-    return gapMs;
+// How long the line is actually on screen (in progress time): until "..." or the next line.
+function lineDisplayMs(line: ActiveLyricLine) {
+    if (line.visibleUntilMs === undefined) return Math.max(3000, estimatedPageCount(line.text) * 2200);
+    return Math.max(1, line.visibleUntilMs - line.timeMs);
 }
 
 interface PagePlan {
@@ -1998,10 +2020,30 @@ function pageStartTimes(line: ActiveLyricLine, chunks: string[], displayMs: numb
     return starts;
 }
 
-function lyricAt(progressMs: number): ActiveLyricLine | undefined {
+type LyricMoment = { kind: "line"; line: ActiveLyricLine; } | { kind: "interlude"; };
+
+function activeLine(index: number): LyricMoment {
+    const line = lyrics[index];
+    const next = lyrics[index + 1];
+    const breakStart = interludeStartMs(line, next);
+    return {
+        kind: "line",
+        line: {
+            ...line,
+            nextTimeMs: next?.timeMs,
+            visibleUntilMs: breakStart !== undefined ? breakStart + getLyricOffsetMs() : next?.timeMs
+        }
+    };
+}
+
+// What the status shows at this moment: a line, an instrumental break ("..."), or undefined when there are no lyrics.
+function lyricAt(progressMs: number): LyricMoment | undefined {
     if (!lyrics.length) return undefined;
 
-    if (progressMs < lyrics[0].timeMs) return undefined;
+    // Intro: "..." only if it's at least 3 s long (like Spicy); otherwise the first line shows right away.
+    if (progressMs < lyrics[0].timeMs) {
+        return settings.store.showWaitingDots && lyrics[0].timeMs >= INTERLUDE_MIN_MS ? { kind: "interlude" } : activeLine(0);
+    }
 
     let low = 0;
     let high = lyrics.length - 1;
@@ -2017,21 +2059,13 @@ function lyricAt(progressMs: number): ActiveLyricLine | undefined {
         }
     }
 
-    if (current < 0) return undefined;
+    if (current < 0) return activeLine(0);
 
-    const line = lyrics[current];
-    const nextLine = lyrics[current + 1];
-    if (settings.store.showWaitingDots && nextLine) {
-        const gapMs = nextLine.timeMs - line.timeMs;
-        if (gapMs >= getGapThresholdMs() && progressMs >= line.timeMs + waitingDotsAfterMs(line.text, gapMs)) {
-            return undefined;
-        }
-    }
+    // The break starts once the line has really ended (song time, i.e. without the offset head start).
+    const breakStart = interludeStartMs(lyrics[current], lyrics[current + 1]);
+    if (breakStart !== undefined && progressMs - getLyricOffsetMs() >= breakStart) return { kind: "interlude" };
 
-    return {
-        ...line,
-        nextTimeMs: nextLine?.timeMs
-    };
+    return activeLine(current);
 }
 
 function tick() {
@@ -2087,19 +2121,18 @@ function tick() {
         return;
     }
 
-    const lyric = lyricAt(track.progressMs);
-    if (lyric) {
-        setProfileStatus(lyricPageForStatus(lyric, track.progressMs));
+    const moment = lyricAt(track.progressMs);
+    if (moment?.kind === "line") {
+        setProfileStatus(lyricPageForStatus(moment.line, track.progressMs));
+        return;
+    }
+    if (moment?.kind === "interlude") {
+        setProfileStatus(getWaitingStatus());
         return;
     }
 
-    if (settings.store.showWaitingDots) {
-        setProfileStatus(getWaitingStatus());
-    } else if (lastTrackKey === loadingTrackKey) {
-        setProfileStatus(formatStatus(settings.store.loadingText, false));
-    } else {
-        setProfileStatus(formatStatus(settings.store.noLyricsText, false));
-    }
+    // No lyrics (yet): say so instead of "..." (the original showed "..." for the whole song).
+    setProfileStatus(formatStatus(lastTrackKey === loadingTrackKey ? settings.store.loadingText : settings.store.noLyricsText, false));
 }
 
 function onSpotifyPlayerState(event: SpotifyStateEvent) {
