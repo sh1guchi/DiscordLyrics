@@ -35,7 +35,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.14";
+const RELEASE_VERSION = "1.0.6-personal.15";
 
 type FontStyleId =
     | "normal"
@@ -1260,11 +1260,12 @@ function getCurrentTrack(): NormalizedTrack | undefined {
     const storeHasTrack = Boolean(storeTrack?.name)
         && !spotifyApiIdle
         && (!recentlyUnavailable || Boolean(SpotifyStore.isPlaying) || (storeRawKey && storeRawKey !== lastTrackKey));
-    const storeChangedTrack = storeHasTrack
-        && Boolean(stateTrack?.name)
-        && storeRawKey !== rawSpotifyTrackKey(stateTrack);
-    const useState = Boolean(stateTrack && stateAge < SPOTIFY_STATE_FRESH_MS && !storeChangedTrack);
-    const useStore = !useState && storeHasTrack;
+    // Discord's store wins whenever it has a track. lyricOffsetMs (+650 ms) was tuned against its position, which
+    // lags real playback by the event's travel time (it starts counting when the event arrives). The Web API's
+    // progress is exact, so once polling actually worked (personal.14) and was preferred, lyrics ran ~0.5-1 s early.
+    // The polled/event state is only the fallback when the store has nothing.
+    const useStore = storeHasTrack;
+    const useState = !useStore && Boolean(stateTrack && stateAge < SPOTIFY_STATE_FRESH_MS);
     const track: SpotifyTrack | null = useStore ? storeTrack : useState ? stateTrack : null;
     if (!track) {
         if (windowsSpotifyTrack && Date.now() - windowsSpotifyTrackReceivedAt < WINDOWS_SPOTIFY_STATE_FRESH_MS) {
