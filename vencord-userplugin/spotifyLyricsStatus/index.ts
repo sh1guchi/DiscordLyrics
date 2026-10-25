@@ -35,7 +35,7 @@ const DEFAULT_SETTINGS = {
     debugLogging: false
 } as const;
 
-const RELEASE_VERSION = "1.0.6-personal.13";
+const RELEASE_VERSION = "1.0.6-personal.14";
 
 type FontStyleId =
     | "normal"
@@ -1325,32 +1325,58 @@ function getCurrentTrack(): NormalizedTrack | undefined {
     return normalized;
 }
 
+interface CurrentlyPlaying {
+    is_playing?: boolean;
+    progress_ms?: number;
+    item?: {
+        id?: string;
+        name?: string;
+        duration_ms?: number;
+        type?: string;
+        publisher?: string;
+        description?: string;
+        html_description?: string;
+        images?: Array<{ url?: string; height?: number; width?: number; }>;
+        album?: {
+            name?: string;
+            images?: Array<{ url?: string; height?: number; width?: number; }>;
+        };
+        artists?: Array<{ name?: string; }>;
+        show?: SpotifyShow;
+    } | null;
+}
+
+interface SpotifyHttpResponse {
+    status?: number;
+    ok?: boolean;
+    body?: CurrentlyPlaying | null;
+}
+
+// SpotifyStore._req goes through Discord's HTTP helper, which resolves to { status, ok, body }: the Spotify JSON
+// is in .body (empty on 204 "nothing playing"). The original read .item off the wrapper, so it never saw any data;
+// harmless while "no item" was ignored, but once that answer started to count, playback looked stopped.
+// nothingPlaying is only true for an unambiguous answer (204, or a body saying nothing plays), so a response shape
+// we don't recognise can never make playback look stopped.
+function unwrapSpotifyResponse(response: SpotifyHttpResponse | CurrentlyPlaying | null | undefined) {
+    if (!response || typeof response !== "object") return { player: null, nothingPlaying: false };
+
+    const isWrapper = "body" in response || "status" in response || "ok" in response;
+    const wrapper = response as SpotifyHttpResponse;
+    const body = isWrapper ? wrapper.body : response as CurrentlyPlaying;
+    const player = body && typeof body === "object" ? body : null;
+
+    const nothingPlaying = (isWrapper && wrapper.status === 204)
+        || (player != null && !player.item && player.is_playing === false);
+    return { player, nothingPlaying };
+}
+
 async function pollSpotifyPlayer(force = false) {
     const now = Date.now();
     if (!force && now < spotifyPollMutedUntil) return;
     if (spotifyPollInFlight || (!force && now - lastSpotifyPollAt < SPOTIFY_POLL_INTERVAL_MS)) return;
 
     const request = (SpotifyStore as unknown as {
-        _req?: (method: "get", route: string) => Promise<{
-            is_playing?: boolean;
-            progress_ms?: number;
-            item?: {
-                id?: string;
-                name?: string;
-                duration_ms?: number;
-                type?: string;
-                publisher?: string;
-                description?: string;
-                html_description?: string;
-                images?: Array<{ url?: string; height?: number; width?: number; }>;
-                album?: {
-                    name?: string;
-                    images?: Array<{ url?: string; height?: number; width?: number; }>;
-                };
-                artists?: Array<{ name?: string; }>;
-                show?: SpotifyShow;
-            } | null;
-        } | null>;
+        _req?: (method: "get", route: string) => Promise<SpotifyHttpResponse | CurrentlyPlaying | null | undefined>;
     })._req;
 
     if (!request) return;
@@ -1359,13 +1385,15 @@ async function pollSpotifyPlayer(force = false) {
     lastSpotifyPollAt = now;
 
     try {
-        const player = await request.call(SpotifyStore, "get", "/currently-playing");
+        const response = await request.call(SpotifyStore, "get", "/currently-playing");
+        const { player, nothingPlaying } = unwrapSpotifyResponse(response);
         // You paused (or skipped) while this request was out: Discord's event is newer, keep it. Otherwise the
         // "playing" answer would put the lyric back for up to one poll interval.
         if (lastSpotifyEventAt > now) return;
         if (!player?.item) {
-            // Podcasts and ads come back with no item while is_playing is true: that's not "nothing playing".
-            if (player?.is_playing) return;
+            // Podcasts and ads come back with no item while is_playing is true, and an unrecognised answer proves
+            // nothing either: only a clear "nothing is playing" counts.
+            if (!nothingPlaying) return;
 
             // Nothing is playing on any device. The original ignored this whenever Discord's store still remembered a
             // track, which kept a stale lyric/pause status up after Spotify stopped or closed. One empty answer may be
